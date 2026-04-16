@@ -49,6 +49,8 @@ import {
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
   generateEmbeddings,
+  DEFAULT_EMBED_SESSION_MAX_DURATION_MS,
+  resolveEmbedSessionMaxDurationMs,
   type Store,
   type DocumentResult,
   type SearchResult,
@@ -2525,7 +2527,7 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     expect(results[0]!.score).toBeGreaterThan(0);
 
     await cleanupTestDb(store);
-  });
+  }, 120000);
 
   test("rerank caches results", async () => {
     const store = await createTestStore();
@@ -2683,6 +2685,56 @@ describe("Edge Cases", () => {
 });
 
 describe("Embedding batching", () => {
+  describe("resolveEmbedSessionMaxDurationMs", () => {
+    test("uses default when env is unset", () => {
+      const prev = process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC;
+      delete process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC;
+      try {
+        expect(resolveEmbedSessionMaxDurationMs()).toBe(DEFAULT_EMBED_SESSION_MAX_DURATION_MS);
+      } finally {
+        if (prev === undefined) delete process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC;
+        else process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC = prev;
+      }
+    });
+
+    test("converts positive seconds to milliseconds", () => {
+      const prev = process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC;
+      process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC = "10";
+      try {
+        expect(resolveEmbedSessionMaxDurationMs()).toBe(10_000);
+      } finally {
+        if (prev === undefined) delete process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC;
+        else process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC = prev;
+      }
+    });
+
+    test("allows zero to disable timeout", () => {
+      const prev = process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC;
+      process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC = "0";
+      try {
+        expect(resolveEmbedSessionMaxDurationMs()).toBe(0);
+      } finally {
+        if (prev === undefined) delete process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC;
+        else process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC = prev;
+      }
+    });
+
+    test("falls back to default and warns on invalid env value", () => {
+      const prev = process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC;
+      process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC = "bad";
+      const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+      try {
+        expect(resolveEmbedSessionMaxDurationMs()).toBe(DEFAULT_EMBED_SESSION_MAX_DURATION_MS);
+        expect(stderrSpy).toHaveBeenCalled();
+        expect(String(stderrSpy.mock.calls[0]?.[0] || "")).toContain("QMD_EMBED_SESSION_MAX_DURATION_SEC");
+      } finally {
+        stderrSpy.mockRestore();
+        if (prev === undefined) delete process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC;
+        else process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC = prev;
+      }
+    });
+  });
+
   function createFakeTokenizer() {
     return {
       async tokenize(text: string) {

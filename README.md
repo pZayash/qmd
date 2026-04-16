@@ -573,6 +573,23 @@ qmd embed --chunk-strategy auto
 qmd query "auth flow" --chunk-strategy auto
 ```
 
+You can override the embedding session timeout for long runs with
+`QMD_EMBED_SESSION_MAX_DURATION_SEC` (in seconds):
+
+```sh
+# 2 hours
+export QMD_EMBED_SESSION_MAX_DURATION_SEC=7200
+qmd embed
+
+# Disable timeout entirely
+export QMD_EMBED_SESSION_MAX_DURATION_SEC=0
+qmd embed
+```
+
+When running `qmd embed`, QMD also checks a `.env` file in the current working
+directory. Resolution order is: process environment first, then `.env`, then the
+default timeout.
+
 **AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
 files at function, class, and import boundaries instead of arbitrary text
 positions. This produces higher-quality chunks and better search results for

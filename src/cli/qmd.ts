@@ -67,6 +67,7 @@ import {
   DEFAULT_EMBED_MODEL,
   DEFAULT_EMBED_MAX_BATCH_BYTES,
   DEFAULT_EMBED_MAX_DOCS_PER_BATCH,
+  DEFAULT_EMBED_SESSION_MAX_DURATION_MS,
   DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
@@ -74,6 +75,7 @@ import {
   getDefaultDbPath,
   reindexCollection,
   generateEmbeddings,
+  resolveEmbedSessionMaxDurationMs,
   syncConfigToDb,
   type ReindexResult,
   type ChunkStrategy,
@@ -1673,6 +1675,50 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
   throw new Error(`--chunk-strategy must be "auto" or "regex" (got "${s}")`);
 }
 
+export function parseDotEnvValue(content: string, key: string): string | undefined {
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match || match[1] !== key) continue;
+
+    let value = match[2] ?? "";
+    value = value.replace(/\s+#.*$/, "").trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      return value.slice(1, -1);
+    }
+
+    return value;
+  }
+
+  return undefined;
+}
+
+function resolveEmbedTimeoutEnvValue(cwd: string): { value: string | undefined; source: "env" | ".env" | "default" } {
+  const envValue = process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC?.trim();
+  if (envValue) {
+    return { value: envValue, source: "env" };
+  }
+
+  const envFilePath = pathJoin(cwd, ".env");
+  if (existsSync(envFilePath)) {
+    try {
+      const fileValue = parseDotEnvValue(readFileSync(envFilePath, "utf-8"), "QMD_EMBED_SESSION_MAX_DURATION_SEC")?.trim();
+      if (fileValue) {
+        return { value: fileValue, source: ".env" };
+      }
+    } catch {
+      // Ignore unreadable .env and fall back to defaults.
+    }
+  }
+
+  return { value: undefined, source: "default" };
+}
+
 async function vectorIndex(
   model: string = DEFAULT_EMBED_MODEL_URI,
   force: boolean = false,
@@ -1699,6 +1745,24 @@ async function vectorIndex(
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
     console.log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
   }
+
+  const embedTimeoutConfig = resolveEmbedTimeoutEnvValue(getPwd());
+  const embedSessionMaxDurationMs = resolveEmbedSessionMaxDurationMs(embedTimeoutConfig.value);
+  if (embedSessionMaxDurationMs === 0) {
+    const suffix = embedTimeoutConfig.source === ".env" ? " (.env)" : "";
+    console.log(`${c.dim}Embed session timeout: disabled (QMD_EMBED_SESSION_MAX_DURATION_SEC=0${suffix})${c.reset}\n`);
+  } else {
+    const sec = Math.round(embedSessionMaxDurationMs / 1000);
+    const suffix = embedTimeoutConfig.source === "env"
+      ? " (env)"
+      : embedTimeoutConfig.source === ".env"
+        ? " (.env)"
+        : embedSessionMaxDurationMs === DEFAULT_EMBED_SESSION_MAX_DURATION_MS
+          ? " (default)"
+          : "";
+    console.log(`${c.dim}Embed session timeout: ${sec}s${suffix}${c.reset}\n`);
+  }
+
   cursor.hide();
   progress.indeterminate();
 

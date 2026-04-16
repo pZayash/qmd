@@ -4,6 +4,9 @@
 
 ### Fixes
 
+- Embedding: add `QMD_EMBED_SESSION_MAX_DURATION_SEC` env var to override
+  `qmd embed` session timeout in seconds (`0` disables timeout), with `.env`
+  fallback from the current working directory when running `qmd embed`.
 - GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides instead of always using auto GPU selection. #529
 - Fix: preserve original filename case in `handelize()`. The previous
   `.toLowerCase()` call made indexed paths unreachable on case-sensitive

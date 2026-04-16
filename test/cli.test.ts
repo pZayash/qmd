@@ -13,7 +13,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
-import { buildEditorUri, termLink } from "../src/cli/qmd.ts";
+import { buildEditorUri, parseDotEnvValue, termLink } from "../src/cli/qmd.ts";
 
 // Test fixtures directory and database path
 let testDir: string;
@@ -253,6 +253,23 @@ describe("CLI Embed", () => {
     const { stderr, exitCode } = await runQmd(["embed", "--max-batch-mb", "0"]);
     expect(exitCode).toBe(1);
     expect(stderr).toContain("maxBatchBytes");
+  });
+
+  test("parseDotEnvValue reads plain assignment", () => {
+    expect(parseDotEnvValue("QMD_EMBED_SESSION_MAX_DURATION_SEC=7200\n", "QMD_EMBED_SESSION_MAX_DURATION_SEC")).toBe("7200");
+  });
+
+  test("parseDotEnvValue supports quoted values and comments", () => {
+    const content = [
+      "# comment",
+      "OTHER_KEY=1",
+      "export QMD_EMBED_SESSION_MAX_DURATION_SEC=\"3600\" # inline comment",
+    ].join("\n");
+    expect(parseDotEnvValue(content, "QMD_EMBED_SESSION_MAX_DURATION_SEC")).toBe("3600");
+  });
+
+  test("parseDotEnvValue returns undefined when key is missing", () => {
+    expect(parseDotEnvValue("OTHER_KEY=1\n", "QMD_EMBED_SESSION_MAX_DURATION_SEC")).toBeUndefined();
   });
 });
 

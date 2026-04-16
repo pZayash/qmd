@@ -46,6 +46,7 @@ export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
 export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
 export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
+export const DEFAULT_EMBED_SESSION_MAX_DURATION_MS = 30 * 60 * 1000; // 30 minutes
 
 // Chunking: 900 tokens per chunk with 15% overlap
 // Increased from 800 to accommodate smart chunking finding natural break points
@@ -1341,6 +1342,21 @@ function resolveEmbedOptions(options?: EmbedOptions): Required<Pick<EmbedOptions
   };
 }
 
+export function resolveEmbedSessionMaxDurationMs(envValue = process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC): number {
+  const normalizedValue = envValue?.trim();
+  if (!normalizedValue) return DEFAULT_EMBED_SESSION_MAX_DURATION_MS;
+
+  const parsed = Number.parseInt(normalizedValue, 10);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    process.stderr.write(
+      `QMD Warning: invalid QMD_EMBED_SESSION_MAX_DURATION_SEC="${normalizedValue}", using default ${DEFAULT_EMBED_SESSION_MAX_DURATION_MS / 1000}s.\n`
+    );
+    return DEFAULT_EMBED_SESSION_MAX_DURATION_MS;
+  }
+
+  return parsed * 1000;
+}
+
 function getPendingEmbeddingDocs(db: Database): PendingEmbeddingDoc[] {
   return db.prepare(`
     SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
@@ -1578,7 +1594,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  }, { maxDuration: resolveEmbedSessionMaxDurationMs(), name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
