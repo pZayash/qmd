@@ -1773,6 +1773,7 @@ async function vectorIndex(
     model,
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
+    sessionMaxDurationMs: embedSessionMaxDurationMs,
     chunkStrategy: batchOptions?.chunkStrategy,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
@@ -2220,7 +2221,10 @@ interface ParsedStructuredQuery {
 }
 
 function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
-  const rawLines = query.split('\n').map((line, idx) => ({
+  // Some wrappers/shells pass literal "\n" instead of real line breaks.
+  // Normalize this form so structured query documents still parse correctly.
+  const normalizedQuery = query.includes('\n') ? query : query.replace(/\\n/g, '\n');
+  const rawLines = normalizedQuery.split('\n').map((line, idx) => ({
     raw: line,
     trimmed: line.trim(),
     number: idx + 1,

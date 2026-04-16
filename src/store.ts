@@ -1303,6 +1303,7 @@ export type EmbedOptions = {
   model?: string;
   maxDocsPerBatch?: number;
   maxBatchBytes?: number;
+  sessionMaxDurationMs?: number;
   chunkStrategy?: ChunkStrategy;
   onProgress?: (info: EmbedProgress) => void;
 };
@@ -1340,6 +1341,16 @@ function resolveEmbedOptions(options?: EmbedOptions): Required<Pick<EmbedOptions
     maxDocsPerBatch: validatePositiveIntegerOption("maxDocsPerBatch", options?.maxDocsPerBatch, DEFAULT_EMBED_MAX_DOCS_PER_BATCH),
     maxBatchBytes: validatePositiveIntegerOption("maxBatchBytes", options?.maxBatchBytes, DEFAULT_EMBED_MAX_BATCH_BYTES),
   };
+}
+
+function resolveEmbedSessionDurationFromOptions(options?: EmbedOptions): number {
+  if (options?.sessionMaxDurationMs === undefined) {
+    return resolveEmbedSessionMaxDurationMs();
+  }
+  if (!Number.isInteger(options.sessionMaxDurationMs) || options.sessionMaxDurationMs < 0) {
+    throw new Error("sessionMaxDurationMs must be a non-negative integer");
+  }
+  return options.sessionMaxDurationMs;
 }
 
 export function resolveEmbedSessionMaxDurationMs(envValue = process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC): number {
@@ -1450,6 +1461,8 @@ export async function generateEmbeddings(
   const embedModelUri = llm.embedModelName;
 
   // Create a session manager for this llm instance
+  const sessionMaxDurationMs = resolveEmbedSessionDurationFromOptions(options);
+
   const result = await withLLMSessionForLlm(llm, async (session) => {
     let chunksEmbedded = 0;
     let errors = 0;
@@ -1594,7 +1607,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors };
-  }, { maxDuration: resolveEmbedSessionMaxDurationMs(), name: 'generateEmbeddings' });
+  }, { maxDuration: sessionMaxDurationMs, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,

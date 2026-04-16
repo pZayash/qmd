@@ -2864,6 +2864,10 @@ describe("Embedding batching", () => {
       await expect(generateEmbeddings(store, { maxBatchBytes: 0 })).rejects.toThrow(
         "maxBatchBytes"
       );
+      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await expect(generateEmbeddings(store, { sessionMaxDurationMs: -1 })).rejects.toThrow(
+        "sessionMaxDurationMs"
+      );
     } finally {
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);

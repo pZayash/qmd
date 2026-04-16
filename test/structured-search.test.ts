@@ -28,7 +28,8 @@ import { disposeDefaultLlamaCpp } from "../src/llm.js";
 // =============================================================================
 
 function parseStructuredQuery(query: string): ExpandedQuery[] | null {
-  const rawLines = query.split('\n').map((line, idx) => ({
+  const normalizedQuery = query.includes('\n') ? query : query.replace(/\\n/g, '\n');
+  const rawLines = normalizedQuery.split('\n').map((line, idx) => ({
     raw: line,
     trimmed: line.trim(),
     number: idx + 1,
@@ -123,6 +124,14 @@ describe("parseStructuredQuery", () => {
   });
 
   describe("multiple prefixed queries", () => {
+    test("literal \\n separators are treated as newlines", () => {
+      const result = parseStructuredQuery("lex: keywords\\nvec: natural language");
+      expect(result).toEqual([
+        { type: "lex", query: "keywords", line: 1 },
+        { type: "vec", query: "natural language", line: 2 },
+      ]);
+    });
+
     test("lex + vec", () => {
       const result = parseStructuredQuery("lex: keywords\nvec: natural language");
       expect(result).toEqual([
