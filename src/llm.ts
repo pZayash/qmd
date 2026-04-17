@@ -1149,9 +1149,11 @@ export class LlamaCpp implements LLM {
     });
 
     const intent = options.intent;
+    const isCyrillic = /[\u0400-\u04FF]/.test(query);
+    const langHint = isCyrillic ? "\nCorpus language: Russian. Output Russian terms." : "";
     const prompt = intent
-      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
-      : `/no_think Expand this search query: ${query}`;
+      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}${langHint}`
+      : `/no_think Expand this search query: ${query}${langHint}`;
 
     // Create a bounded context for expansion to prevent large default VRAM allocations.
     const genContext = await this.generateModel!.createContext({
@@ -1177,8 +1179,10 @@ export class LlamaCpp implements LLM {
       });
 
       const lines = result.trim().split("\n");
-      const queryLower = query.toLowerCase();
-      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+      const queryTerms = query.toLowerCase()
+        .replace(/[^\p{L}\p{N}\s]/gu, " ")
+        .split(/\s+/)
+        .filter(t => t.length > 1);
 
       const hasQueryTerm = (text: string): boolean => {
         const lower = text.toLowerCase();

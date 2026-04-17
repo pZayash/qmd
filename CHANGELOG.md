@@ -4,6 +4,12 @@
 
 ### Fixes
 
+- Fix: `qmd query` now correctly filters query expansions for Russian (Cyrillic)
+  input. The `hasQueryTerm` relevance guard used an ASCII-only regex that stripped
+  all Cyrillic characters, disabling the filter entirely. Replaced with a
+  Unicode-aware pattern (`\p{L}\p{N}`). The expansion prompt also receives a
+  language hint when the query is Cyrillic, so Qwen3 returns Russian-language
+  `lex:`/`vec:` variants instead of English paraphrases.
 - Embedding: add `QMD_EMBED_SESSION_MAX_DURATION_SEC` env var to override
   `qmd embed` session timeout in seconds (`0` disables timeout), with `.env`
   fallback from the current working directory when running `qmd embed`.

@@ -287,3 +287,50 @@ describe("sanitizeFTS5Term", () => {
     expect(sanitizeFTS5Term("日本語")).toBe("日本語");
   });
 });
+
+// =============================================================================
+// Unicode queryTerms extraction (mirrors logic in llm.ts expandQuery)
+// =============================================================================
+
+function extractQueryTerms(query: string): string[] {
+  return query.toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(t => t.length > 1);
+}
+
+describe("queryTerms Unicode extraction", () => {
+  test("extracts Cyrillic terms from Russian query", () => {
+    const terms = extractQueryTerms("СтруктурнаяЕдиницаПродажи ЗаказПокупателя");
+    expect(terms).toHaveLength(2);
+    expect(terms).toContain("структурнаяединицапродажи");
+    expect(terms).toContain("заказпокупателя");
+  });
+
+  test("still works for Latin query", () => {
+    const terms = extractQueryTerms("authentication token");
+    expect(terms).toContain("authentication");
+    expect(terms).toContain("token");
+  });
+
+  test("mixed Cyrillic and Latin keeps both scripts", () => {
+    const terms = extractQueryTerms("СтруктурнаяЕдиница ProductSales");
+    expect(terms).toContain("структурнаяединица");
+    expect(terms).toContain("productsales");
+  });
+
+  test("strips punctuation without dropping words", () => {
+    const terms = extractQueryTerms("hello-world foo.bar");
+    expect(terms).toContain("hello");
+    expect(terms).toContain("world");
+    expect(terms).toContain("foo");
+    expect(terms).toContain("bar");
+  });
+
+  test("filters single-char tokens", () => {
+    const terms = extractQueryTerms("a b cd");
+    expect(terms).not.toContain("a");
+    expect(terms).not.toContain("b");
+    expect(terms).toContain("cd");
+  });
+});
