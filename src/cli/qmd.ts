@@ -2223,7 +2223,7 @@ interface ParsedStructuredQuery {
 function parseStructuredQuery(query: string): ParsedStructuredQuery | null {
   // Some wrappers/shells pass literal "\n" instead of real line breaks.
   // Normalize this form so structured query documents still parse correctly.
-  const normalizedQuery = query.includes('\n') ? query : query.replace(/\\n/g, '\n');
+  const normalizedQuery = query.replace(/\\n/g, '\n').replace(/\r\n/g, '\n');
   const rawLines = normalizedQuery.split('\n').map((line, idx) => ({
     raw: line,
     trimmed: line.trim(),

@@ -28,7 +28,7 @@ import { disposeDefaultLlamaCpp } from "../src/llm.js";
 // =============================================================================
 
 function parseStructuredQuery(query: string): ExpandedQuery[] | null {
-  const normalizedQuery = query.includes('\n') ? query : query.replace(/\\n/g, '\n');
+  const normalizedQuery = query.replace(/\\n/g, '\n').replace(/\r\n/g, '\n');
   const rawLines = normalizedQuery.split('\n').map((line, idx) => ({
     raw: line,
     trimmed: line.trim(),
@@ -164,6 +164,18 @@ describe("parseStructuredQuery", () => {
         { type: "hyde", query: "passage", line: 1 },
         { type: "vec", query: "question", line: 2 },
         { type: "lex", query: "keywords", line: 3 },
+      ]);
+    });
+
+    test("mixed real newline + literal \\n — both parsed (case1 regression)", () => {
+      // Real \n after first line; lex/vec separated by literal \n two-char sequence.
+      // Old guard skipped normalization when any real \n present → vec was swallowed.
+      const q = "lex: foo\nlex: bar\\nvec: baz";
+      const result = parseStructuredQuery(q);
+      expect(result).toEqual([
+        { type: "lex", query: "foo", line: 1 },
+        { type: "lex", query: "bar", line: 2 },
+        { type: "vec", query: "baz", line: 3 },
       ]);
     });
   });
