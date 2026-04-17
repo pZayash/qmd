@@ -2,7 +2,7 @@ import { openDatabase } from "../db.js";
 import type { Database } from "../db.js";
 import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { dirname, join as pathJoin, relative as relativePath } from "path";
 import { parseArgs } from "util";
 import { readFileSync, realpathSync, statSync, existsSync, unlinkSync, writeFileSync, openSync, closeSync, mkdirSync, lstatSync, rmSync, symlinkSync, readlinkSync } from "fs";
@@ -346,19 +346,26 @@ async function showStatus(): Promise<void> {
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
-  // MCP daemon status (check PID file liveness)
+  // MCP daemon status (ping /health — more reliable than process.kill on Windows)
   const mcpCacheDir = process.env.XDG_CACHE_HOME
     ? resolve(process.env.XDG_CACHE_HOME, "qmd")
     : resolve(homedir(), ".cache", "qmd");
   const mcpPidPath = resolve(mcpCacheDir, "mcp.pid");
-  if (existsSync(mcpPidPath)) {
-    const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
+  const mcpPortPath = resolve(mcpCacheDir, "daemon.port");
+  if (existsSync(mcpPortPath)) {
+    const mcpPort = parseInt(readFileSync(mcpPortPath, "utf-8").trim());
     try {
-      process.kill(mcpPid, 0);
-      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
+      const h = await fetch(`http://127.0.0.1:${mcpPort}/health`, { signal: AbortSignal.timeout(500) });
+      if (h.ok) {
+        const info = await h.json() as { pid?: number };
+        const pid = info.pid ?? (existsSync(mcpPidPath) ? parseInt(readFileSync(mcpPidPath, "utf-8").trim()) : null);
+        const pidSuffix = pid ? ` (PID ${pid})` : "";
+        console.log(`MCP:   ${c.green}running${c.reset}${pidSuffix}  http://127.0.0.1:${mcpPort}/health`);
+      } else {
+        throw new Error("not ok");
+      }
     } catch {
-      unlinkSync(mcpPidPath);
-      // Stale PID file cleaned up silently
+      // Health ping failed — daemon may be down, just skip the MCP line
     }
   }
   console.log("");
@@ -2898,7 +2905,111 @@ async function showVersion(): Promise<void> {
   console.log(`qmd ${versionStr}`);
 }
 
+// =============================================================================
+// Daemon thin client
+// =============================================================================
+
+const DAEMON_ELIGIBLE_CMDS = new Set([
+  "search", "vsearch", "vector-search",
+  "query", "deep-search",
+  "get", "multi-get",
+  "ls",
+]);
+
+function isEligibleForDaemon(argv: string[]): boolean {
+  const cmd = argv[0];
+  if (!cmd) return false;
+  if (DAEMON_ELIGIBLE_CMDS.has(cmd)) return true;
+  if (cmd === "collection") {
+    const sub = argv[1];
+    return !sub || sub === "list";
+  }
+  return false;
+}
+
+async function tryDaemon(argv: string[]): Promise<void> {
+  if (!isEligibleForDaemon(argv)) return;
+  if (process.env.QMD_NO_DAEMON === "1") return;
+
+  const daemonCacheDir = process.env.XDG_CACHE_HOME
+    ? resolve(process.env.XDG_CACHE_HOME, "qmd")
+    : resolve(homedir(), ".cache", "qmd");
+  const pidPath  = resolve(daemonCacheDir, "mcp.pid");
+  const portPath = resolve(daemonCacheDir, "daemon.port");
+
+  // Check if daemon already running by pinging /health (more reliable than process.kill on Windows)
+  let port: number | null = null;
+  if (existsSync(portPath)) {
+    const savedPort = parseInt(readFileSync(portPath, "utf-8").trim());
+    if (!isNaN(savedPort)) {
+      try {
+        const h = await fetch(`http://127.0.0.1:${savedPort}/health`, { signal: AbortSignal.timeout(500) });
+        if (h.ok) port = savedPort;
+      } catch { /* not running */ }
+    }
+    if (port === null) {
+      // Stale port file — clean up so auto-start can proceed
+      try { unlinkSync(portPath); } catch { }
+      try { if (existsSync(pidPath)) unlinkSync(pidPath); } catch { }
+    }
+  }
+
+  // Auto-start daemon if not running
+  if (port === null) {
+    const defaultPort = 8181;
+    mkdirSync(daemonCacheDir, { recursive: true });
+    const selfPath  = fileURLToPath(import.meta.url);
+    const logPath   = resolve(daemonCacheDir, "mcp.log");
+    const logFd     = openSync(logPath, "a"); // append so we don't clobber existing log
+    const spawnArgs = selfPath.endsWith(".ts")
+      ? ["--import", pathToFileURL(pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs")).href,
+         selfPath, "mcp", "--http", "--port", String(defaultPort)]
+      : [selfPath, "mcp", "--http", "--port", String(defaultPort)];
+    const child = nodeSpawn(process.execPath, spawnArgs, {
+      stdio: ["ignore", logFd, logFd],
+      detached: true,
+      env: { ...process.env, QMD_NO_DAEMON: "1" },
+    });
+    child.unref();
+    closeSync(logFd);
+    writeFileSync(pidPath, String(child.pid));
+    writeFileSync(portPath, String(defaultPort));
+
+    // Wait for HTTP server ready (poll /health, up to 8s)
+    const deadline = Date.now() + 8000;
+    let ready = false;
+    while (Date.now() < deadline) {
+      try {
+        const h = await fetch(`http://127.0.0.1:${defaultPort}/health`, { signal: AbortSignal.timeout(300) });
+        if (h.ok) { ready = true; break; }
+      } catch { /* not up yet */ }
+      await new Promise(r => setTimeout(r, 150));
+    }
+    if (!ready) return; // failed to start → fall through to local execution
+    port = defaultPort;
+  }
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/rpc`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ argv, cwd: process.cwd() }),
+      signal:  AbortSignal.timeout(60_000),
+    });
+    if (!res.ok) return;
+    const { stdout, stderr, exitCode } = await res.json() as { stdout: string; stderr: string; exitCode: number };
+    if (stdout) process.stdout.write(stdout);
+    if (stderr) process.stderr.write(stderr);
+    process.exit(exitCode);
+  } catch {
+    return; // daemon unreachable → fall through
+  }
+}
+
+// =============================================================================
 // Main CLI - only run if this is the main module
+// =============================================================================
+
 const __filename = fileURLToPath(import.meta.url);
 const argv1 = process.argv[1];
 const isMain = argv1 === __filename
@@ -2936,6 +3047,8 @@ if (isMain) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
   }
+
+  await tryDaemon(process.argv.slice(2));
 
   switch (cli.command) {
     case "context": {
@@ -3284,6 +3397,7 @@ if (isMain) {
         ? resolve(process.env.XDG_CACHE_HOME, "qmd")
         : resolve(homedir(), ".cache", "qmd");
       const pidPath = resolve(cacheDir, "mcp.pid");
+      const portPath = resolve(cacheDir, "daemon.port");
 
       // Subcommands take priority over flags
       if (sub === "stop") {
@@ -3296,9 +3410,11 @@ if (isMain) {
           process.kill(pid, 0); // alive?
           process.kill(pid, "SIGTERM");
           unlinkSync(pidPath);
+          if (existsSync(portPath)) unlinkSync(portPath);
           console.log(`Stopped QMD MCP server (PID ${pid}).`);
         } catch {
           unlinkSync(pidPath);
+          if (existsSync(portPath)) unlinkSync(portPath);
           console.log("Cleaned up stale PID file (server was not running).");
         }
         process.exit(0);
@@ -3325,7 +3441,7 @@ if (isMain) {
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs"), selfPath, "mcp", "--http", "--port", String(port)]
+            ? ["--import", pathToFileURL(pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs")).href, selfPath, "mcp", "--http", "--port", String(port)]
             : [selfPath, "mcp", "--http", "--port", String(port)];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
@@ -3335,6 +3451,7 @@ if (isMain) {
           closeSync(logFd); // parent's copy; child inherited the fd
 
           writeFileSync(pidPath, String(child.pid));
+          writeFileSync(portPath, String(port));
           console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);

@@ -11,6 +11,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { parseArgs } from "node:util";
 import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -28,9 +29,19 @@ import {
   type QMDStore,
   type ExpandedQuery,
   type IndexStatus,
+  type HybridQueryResult,
+  type SearchResult,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
+import {
+  searchResultsToJson,
+  searchResultsToCsv,
+  searchResultsToMarkdown,
+  searchResultsToXml,
+  searchResultsToFiles,
+  type OutputFormat,
+} from "../cli/formatter.js";
 
 enableProductionMode();
 
@@ -552,6 +563,276 @@ export async function startMcpServer(): Promise<void> {
 }
 
 // =============================================================================
+// RPC Command Execution (for persistent daemon thin-client mode)
+// =============================================================================
+
+type RpcResult = { stdout: string; stderr: string; exitCode: number };
+
+function formatSearchOutput(
+  results: SearchResult[],
+  query: string,
+  format: OutputFormat,
+  opts: { full?: boolean; lineNumbers?: boolean; intent?: string } = {}
+): string {
+  if (results.length === 0) return format === "json" ? "[]" : "No results.";
+  switch (format) {
+    case "json":  return searchResultsToJson(results, { query, ...opts });
+    case "csv":   return searchResultsToCsv(results, { query, ...opts });
+    case "md":    return searchResultsToMarkdown(results, { query, ...opts });
+    case "xml":   return searchResultsToXml(results, { query, ...opts });
+    case "files": return searchResultsToFiles(results);
+    default: {
+      const lines: string[] = [];
+      for (const r of results) {
+        const score = `${(r.score * 100).toFixed(0).padStart(3)}%`;
+        lines.push(`${score}  #${r.docid}  ${r.displayPath}`);
+        if (r.body) {
+          const { snippet } = extractSnippet(r.body, query, 200, r.chunkPos, undefined, opts.intent);
+          const preview = snippet.trim().replace(/\n+/g, " ").slice(0, 120);
+          if (preview) lines.push(`       ${preview}`);
+        }
+        lines.push("");
+      }
+      return lines.join("\n");
+    }
+  }
+}
+
+function formatHybridOutput(
+  results: HybridQueryResult[],
+  query: string,
+  format: OutputFormat,
+  opts: { full?: boolean; lineNumbers?: boolean; intent?: string } = {}
+): string {
+  if (results.length === 0) return format === "json" ? "[]" : "No results.";
+  switch (format) {
+    case "json": {
+      const items = results.map(r => ({
+        docid: `#${r.docid}`,
+        score: Math.round(r.score * 100) / 100,
+        file: r.displayPath,
+        title: r.title,
+        ...(r.context && { context: r.context }),
+        snippet: extractSnippet(r.bestChunk, query, 300, undefined, undefined, opts.intent).snippet,
+      }));
+      return JSON.stringify(items, null, 2);
+    }
+    case "files":
+      return results.map(r => `#${r.docid},${r.score.toFixed(2)},${r.displayPath}`).join("\n");
+    default: {
+      const lines: string[] = [];
+      for (const r of results) {
+        const score = `${(r.score * 100).toFixed(0).padStart(3)}%`;
+        lines.push(`${score}  #${r.docid}  ${r.displayPath}`);
+        if (r.bestChunk) {
+          const { snippet } = extractSnippet(r.bestChunk, query, 200, undefined, undefined, opts.intent);
+          const preview = snippet.trim().replace(/\n+/g, " ").slice(0, 120);
+          if (preview) lines.push(`       ${preview}`);
+        }
+        lines.push("");
+      }
+      return lines.join("\n");
+    }
+  }
+}
+
+async function executeRpcCommand(argv: string[], _cwd: string, store: QMDStore): Promise<RpcResult> {
+  let stdout = "";
+  let stderr = "";
+  let exitCode = 0;
+
+  const out = (s: string) => { stdout += s + "\n"; };
+  const err = (s: string) => { stderr += s + "\n"; };
+
+  try {
+    const { values, positionals } = parseArgs({
+      args: argv,
+      options: {
+        n:              { type: "string" },
+        c:              { type: "string", multiple: true },
+        collection:     { type: "string", multiple: true },
+        json:           { type: "boolean" },
+        csv:            { type: "boolean" },
+        md:             { type: "boolean" },
+        xml:            { type: "boolean" },
+        files:          { type: "boolean" },
+        full:           { type: "boolean" },
+        all:            { type: "boolean" },
+        "min-score":    { type: "string" },
+        "line-numbers": { type: "boolean" },
+        explain:        { type: "boolean" },
+        intent:         { type: "string" },
+        "skip-rerank":  { type: "boolean" },
+        from:           { type: "string" },
+        l:              { type: "string" },
+        "max-bytes":    { type: "string" },
+      },
+      allowPositionals: true,
+      strict: false,
+    });
+
+    const command  = positionals[0] ?? "";
+    const args     = positionals.slice(1);
+    const query    = args.join(" ");
+
+    const format: OutputFormat = values.json ? "json"
+      : values.csv   ? "csv"
+      : values.md    ? "md"
+      : values.xml   ? "xml"
+      : values.files ? "files"
+      : "cli";
+
+    const collectionFilter = [...(values.c ?? []), ...(values.collection ?? [])].map(String);
+    const collectionOpt    = collectionFilter.length === 1 ? collectionFilter[0] : undefined;
+    const limit            = values.n ? parseInt(String(values.n)) : (values.all ? 10000 : 10);
+    const minScore         = values["min-score"] ? parseFloat(String(values["min-score"])) : 0;
+    const intentStr        = typeof values.intent === "string" ? values.intent : undefined;
+    const fmtOpts          = { full: !!values.full, lineNumbers: !!values["line-numbers"], intent: intentStr };
+
+    switch (command) {
+      case "search": {
+        if (!query) { err("Usage: qmd search [options] <query>"); exitCode = 1; break; }
+        const results = await store.searchLex(query, { limit, collection: collectionOpt });
+        out(formatSearchOutput(results, query, format, fmtOpts));
+        break;
+      }
+
+      case "vsearch":
+      case "vector-search": {
+        if (!query) { err("Usage: qmd vsearch [options] <query>"); exitCode = 1; break; }
+        const effectiveMinScore = minScore || 0.3;
+        let results = await store.searchVector(query, { limit, collection: collectionOpt });
+        results = results.filter(r => r.score >= effectiveMinScore);
+        out(formatSearchOutput(results, query, format, fmtOpts));
+        break;
+      }
+
+      case "query":
+      case "deep-search": {
+        if (!query) { err("Usage: qmd query [options] <query>"); exitCode = 1; break; }
+        const results = await store.search({
+          query,
+          limit,
+          minScore,
+          collection: collectionOpt,
+          intent:     intentStr,
+          rerank:     !values["skip-rerank"],
+          explain:    !!values.explain,
+        });
+        out(formatHybridOutput(results, query, format, fmtOpts));
+        break;
+      }
+
+      case "get": {
+        const file = args[0];
+        if (!file) { err("Usage: qmd get <filepath>"); exitCode = 1; break; }
+        const fromLine = values.from ? parseInt(String(values.from)) : undefined;
+        const maxLines = values.l ? parseInt(String(values.l)) : undefined;
+        const body = await store.getDocumentBody(file, { fromLine, maxLines });
+        if (body === null) { err(`Not found: ${file}`); exitCode = 1; break; }
+        out(values["line-numbers"] ? addLineNumbers(body) : body);
+        break;
+      }
+
+      case "multi-get": {
+        const pattern = args[0];
+        if (!pattern) { err("Usage: qmd multi-get <pattern>"); exitCode = 1; break; }
+        const maxBytes = values["max-bytes"] ? parseInt(String(values["max-bytes"])) : DEFAULT_MULTI_GET_MAX_BYTES;
+        const maxLines = values.l ? parseInt(String(values.l)) : undefined;
+        const { docs, errors } = await store.multiGet(pattern, { maxBytes });
+        for (const e of errors) err(e);
+        if (format === "json") {
+          const items = docs.map(d => ({
+            file: d.doc.displayPath, title: !d.skipped ? d.doc.title : d.doc.displayPath,
+            ...(!d.skipped && d.doc.context && { context: d.doc.context }),
+            ...(!d.skipped ? { body: d.doc.body } : { skipped: true, reason: d.skipReason }),
+          }));
+          out(JSON.stringify(items, null, 2));
+        } else {
+          for (const doc of docs) {
+            out(`\n--- ${doc.doc.displayPath} ---`);
+            if (doc.skipped) { out(`(skipped: ${doc.skipReason})`); continue; }
+            let body = doc.doc.body ?? "";
+            if (maxLines) body = body.split("\n").slice(0, maxLines).join("\n");
+            if (values["line-numbers"]) body = addLineNumbers(body);
+            out(body);
+          }
+        }
+        break;
+      }
+
+      case "ls": {
+        const collections = await store.listCollections();
+        const pathArg = args[0];
+        if (!pathArg) {
+          if (format === "json") {
+            out(JSON.stringify(collections, null, 2));
+          } else {
+            for (const col of collections) {
+              out(`${col.name.padEnd(20)} ${String(col.active_count).padStart(5)} docs  ${col.pwd}`);
+            }
+          }
+        } else {
+          // List files within collection prefix via internal store
+          const colName = pathArg.replace(/^qmd:\/\//, "").split("/")[0]!;
+          const col = collections.find(c => c.name === colName);
+          if (!col) { err(`Collection not found: ${colName}`); exitCode = 1; break; }
+          const paths = store.internal.getActiveDocumentPaths(colName);
+          const prefix = pathArg.includes("/") ? pathArg.replace(/^qmd:\/\/[^/]+\//, "") : "";
+          const filtered = prefix ? paths.filter(p => p.includes(prefix)) : paths;
+          if (format === "json") {
+            out(JSON.stringify(filtered));
+          } else {
+            for (const p of filtered) out(p);
+          }
+        }
+        break;
+      }
+
+      case "status": {
+        const status = await store.getStatus();
+        if (format === "json") {
+          out(JSON.stringify(status, null, 2));
+        } else {
+          out(`Collections: ${status.collections.length}`);
+          out(`Total docs:  ${status.totalDocuments}`);
+          if (status.needsEmbedding > 0) out(`Pending:     ${status.needsEmbedding} (run 'qmd embed')`);
+        }
+        break;
+      }
+
+      case "collection": {
+        const sub = args[0];
+        if (sub === "list" || !sub) {
+          const collections = await store.listCollections();
+          if (format === "json") {
+            out(JSON.stringify(collections, null, 2));
+          } else {
+            for (const col of collections) {
+              const excl = col.includeByDefault ? "" : "  [excluded]";
+              out(`${col.name.padEnd(20)} ${String(col.active_count).padStart(5)} docs${excl}  ${col.pwd}`);
+            }
+          }
+        } else {
+          err(`'collection ${sub}' not supported via daemon`);
+          exitCode = 1;
+        }
+        break;
+      }
+
+      default:
+        err(`Unknown command: ${command}`);
+        exitCode = 1;
+    }
+  } catch (e: any) {
+    err(e?.message ?? String(e));
+    exitCode = 1;
+  }
+
+  return { stdout, stderr, exitCode };
+}
+
+// =============================================================================
 // Transport: Streamable HTTP
 // =============================================================================
 
@@ -602,6 +883,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
+  let lastRequest: { label: string; at: string; ms: number } | null = null;
 
   /** Format timestamp for request logging */
   function ts(): string {
@@ -643,10 +925,15 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
     try {
       if (pathname === "/health" && nodeReq.method === "GET") {
-        const body = JSON.stringify({ status: "ok", uptime: Math.floor((Date.now() - startTime) / 1000) });
+        const body = JSON.stringify({
+          status: "ok",
+          pid: process.pid,
+          uptime: Math.floor((Date.now() - startTime) / 1000),
+          sessions: sessions.size,
+          lastRequest,
+        }, null, 2);
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(body);
-        log(`${ts()} GET /health (${Date.now() - reqStart}ms)`);
         return;
       }
 
@@ -699,7 +986,22 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
         nodeRes.writeHead(200, { "Content-Type": "application/json" });
         nodeRes.end(JSON.stringify({ results: formatted }));
-        log(`${ts()} POST /query ${params.searches.length} queries (${Date.now() - reqStart}ms)`);
+        const queryMs = Date.now() - reqStart;
+        lastRequest = { label: `POST /query (${params.searches.length} queries)`, at: new Date().toISOString(), ms: queryMs };
+        log(`${ts()} POST /query ${params.searches.length} queries (${queryMs}ms)`);
+        return;
+      }
+
+      // RPC endpoint: execute CLI commands using the daemon's pre-warmed store
+      if (pathname === "/rpc" && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        const { argv, cwd } = JSON.parse(rawBody) as { argv: string[]; cwd: string };
+        const result = await executeRpcCommand(argv, cwd, store);
+        nodeRes.writeHead(200, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify(result));
+        const rpcMs = Date.now() - reqStart;
+        lastRequest = { label: `${argv.join(" ")}`, at: new Date().toISOString(), ms: rpcMs };
+        log(`${ts()} POST /rpc ${argv.join(" ")} → exit ${result.exitCode} (${rpcMs}ms)`);
         return;
       }
 
@@ -746,7 +1048,9 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
         nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
         nodeRes.end(Buffer.from(await response.arrayBuffer()));
-        log(`${ts()} POST /mcp ${label} (${Date.now() - reqStart}ms)`);
+        const mcpMs = Date.now() - reqStart;
+        lastRequest = { label: `MCP ${label}`, at: new Date().toISOString(), ms: mcpMs };
+        log(`${ts()} POST /mcp ${label} (${mcpMs}ms)`);
         return;
       }
 
@@ -798,7 +1102,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    httpServer.listen(port, "127.0.0.1", () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
