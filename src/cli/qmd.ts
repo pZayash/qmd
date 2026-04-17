@@ -2412,6 +2412,8 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
   await withLLMSession(async () => {
     let results;
+    let rerankTicker: ReturnType<typeof setInterval> | undefined;
+    let rerankTickerStart = 0;
 
     if (parsed) {
       const structuredQueries = parsed.searches;
@@ -2447,10 +2449,17 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
           onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
+            const estSec = chunkCount > 15 ? ` (~${Math.round(chunkCount * 2)}s)` : '';
+            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks${estSec}...${c.reset}`);
             progress.indeterminate();
+            rerankTickerStart = Date.now();
+            rerankTicker = setInterval(() => {
+              const elapsed = Math.round((Date.now() - rerankTickerStart) / 1000);
+              process.stderr.write(`\r${c.dim}Reranking ${chunkCount} chunks${estSec}... ${elapsed}s${c.reset}`);
+            }, 10_000);
           },
           onRerankDone: (ms) => {
+            clearInterval(rerankTicker);
             progress.clear();
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
@@ -2473,8 +2482,14 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
           },
           onExpandStart: () => {
             process.stderr.write(`${c.dim}Expanding query...${c.reset}`);
+            rerankTickerStart = Date.now();
+            rerankTicker = setInterval(() => {
+              const elapsed = Math.round((Date.now() - rerankTickerStart) / 1000);
+              process.stderr.write(`\r${c.dim}Expanding query... ${elapsed}s${c.reset}`);
+            }, 10_000);
           },
           onExpand: (original, expanded, ms) => {
+            clearInterval(rerankTicker);
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
             logExpansionTree(original, expanded);
             process.stderr.write(`${c.dim}Searching ${expanded.length + 1} queries...${c.reset}\n`);
@@ -2486,10 +2501,17 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
           onRerankStart: (chunkCount) => {
-            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks...${c.reset}`);
+            const estSec = chunkCount > 15 ? ` (~${Math.round(chunkCount * 2)}s)` : '';
+            process.stderr.write(`${c.dim}Reranking ${chunkCount} chunks${estSec}...${c.reset}`);
             progress.indeterminate();
+            rerankTickerStart = Date.now();
+            rerankTicker = setInterval(() => {
+              const elapsed = Math.round((Date.now() - rerankTickerStart) / 1000);
+              process.stderr.write(`\r${c.dim}Reranking ${chunkCount} chunks${estSec}... ${elapsed}s${c.reset}`);
+            }, 10_000);
           },
           onRerankDone: (ms) => {
+            clearInterval(rerankTicker);
             progress.clear();
             process.stderr.write(`${c.dim} (${formatMs(ms)})${c.reset}\n`);
           },
