@@ -662,7 +662,11 @@ async function executeRpcCommand(argv: string[], _cwd: string, store: QMDStore):
         "line-numbers": { type: "boolean" },
         explain:        { type: "boolean" },
         intent:         { type: "string" },
+        path:           { type: "string", multiple: true },
+        "no-rerank":    { type: "boolean" },
         "skip-rerank":  { type: "boolean" },
+        C:              { type: "string" },
+        "candidate-limit": { type: "string" },
         from:           { type: "string" },
         l:              { type: "string" },
         "max-bytes":    { type: "string" },
@@ -687,12 +691,15 @@ async function executeRpcCommand(argv: string[], _cwd: string, store: QMDStore):
     const limit            = values.n ? parseInt(String(values.n)) : (values.all ? 10000 : 10);
     const minScore         = values["min-score"] ? parseFloat(String(values["min-score"])) : 0;
     const intentStr        = typeof values.intent === "string" ? values.intent : undefined;
+    const pathPrefixes     = (values.path ?? [])
+      .map(String)
+      .map(p => p.replace(/\\/g, "/").replace(/^\/+/, ""));
     const fmtOpts          = { full: !!values.full, lineNumbers: !!values["line-numbers"], intent: intentStr };
 
     switch (command) {
       case "search": {
         if (!query) { err("Usage: qmd search [options] <query>"); exitCode = 1; break; }
-        const results = await store.searchLex(query, { limit, collection: collectionOpt });
+        const results = await store.searchLex(query, { limit, collection: collectionOpt, pathPrefixes });
         out(formatSearchOutput(results, query, format, fmtOpts));
         break;
       }
@@ -701,7 +708,7 @@ async function executeRpcCommand(argv: string[], _cwd: string, store: QMDStore):
       case "vector-search": {
         if (!query) { err("Usage: qmd vsearch [options] <query>"); exitCode = 1; break; }
         const effectiveMinScore = minScore || 0.3;
-        let results = await store.searchVector(query, { limit, collection: collectionOpt });
+        let results = await store.searchVector(query, { limit, collection: collectionOpt, pathPrefixes });
         results = results.filter(r => r.score >= effectiveMinScore);
         out(formatSearchOutput(results, query, format, fmtOpts));
         break;
@@ -715,8 +722,9 @@ async function executeRpcCommand(argv: string[], _cwd: string, store: QMDStore):
           limit,
           minScore,
           collection: collectionOpt,
+          pathPrefixes,
           intent:     intentStr,
-          rerank:     !values["skip-rerank"],
+          rerank:     !(values["skip-rerank"] || values["no-rerank"]),
           explain:    !!values.explain,
         });
         out(formatHybridOutput(results, query, format, fmtOpts));

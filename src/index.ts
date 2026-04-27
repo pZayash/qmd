@@ -157,6 +157,8 @@ export interface SearchOptions {
   collection?: string;
   /** Filter to specific collections */
   collections?: string[];
+  /** Restrict to collection-relative path prefix(es) */
+  pathPrefixes?: string[];
   /** Max results (default: 10) */
   limit?: number;
   /** Minimum score threshold */
@@ -173,6 +175,7 @@ export interface SearchOptions {
 export interface LexSearchOptions {
   limit?: number;
   collection?: string;
+  pathPrefixes?: string[];
 }
 
 /**
@@ -181,6 +184,7 @@ export interface LexSearchOptions {
 export interface VectorSearchOptions {
   limit?: number;
   collection?: string;
+  pathPrefixes?: string[];
 }
 
 /**
@@ -396,6 +400,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         // Pre-expanded queries — use structuredSearch
         return structuredSearch(internal, opts.queries, {
           collections: collections.length > 0 ? collections : undefined,
+          pathPrefixes: opts.pathPrefixes,
           limit: opts.limit,
           minScore: opts.minScore,
           explain: opts.explain,
@@ -408,6 +413,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       // Simple query string — use hybridQuery (expand + search + rerank)
       return hybridQuery(internal, opts.query!, {
         collection: collections[0],
+        pathPrefixes: opts.pathPrefixes,
         limit: opts.limit,
         minScore: opts.minScore,
         explain: opts.explain,
@@ -416,8 +422,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
-    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection),
+    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection, opts?.pathPrefixes),
+    searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection, undefined, undefined, opts?.pathPrefixes),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {

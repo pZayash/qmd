@@ -415,6 +415,11 @@ export type LlamaCppConfig = {
    */
   expandContextSize?: number;
   /**
+   * Max query expansion generation time in ms before falling back to the original query.
+   * Default: 20s. Can also be set via QMD_EXPAND_TIMEOUT_MS.
+   */
+  expandTimeoutMs?: number;
+  /**
    * Inactivity timeout in ms before unloading contexts (default: 2 minutes, 0 to disable).
    *
    * Per node-llama-cpp lifecycle guidance, we prefer keeping models loaded and only disposing
@@ -437,6 +442,8 @@ export type LlamaCppConfig = {
 // Default inactivity timeout: 5 minutes (keep models warm during typical search sessions)
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
+const DEFAULT_EXPAND_TIMEOUT_MS = 20_000;
+const DEFAULT_EXPAND_MAX_TOKENS = 160;
 
 type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
 
@@ -471,6 +478,27 @@ function resolveExpandContextSize(configValue?: number): number {
   return parsed;
 }
 
+function resolveExpandTimeoutMs(configValue?: number): number {
+  if (configValue !== undefined) {
+    if (!Number.isFinite(configValue) || configValue < 0) {
+      throw new Error(`Invalid expandTimeoutMs: ${configValue}. Must be a non-negative number.`);
+    }
+    return configValue;
+  }
+
+  const envValue = process.env.QMD_EXPAND_TIMEOUT_MS?.trim();
+  if (!envValue) return DEFAULT_EXPAND_TIMEOUT_MS;
+
+  const parsed = Number.parseInt(envValue, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    process.stderr.write(
+      `QMD Warning: invalid QMD_EXPAND_TIMEOUT_MS="${envValue}", using default ${DEFAULT_EXPAND_TIMEOUT_MS}.\n`
+    );
+    return DEFAULT_EXPAND_TIMEOUT_MS;
+  }
+  return parsed;
+}
+
 export class LlamaCpp implements LLM {
   private readonly _ciMode = !!process.env.CI;
   private llama: Llama | null = null;
@@ -485,6 +513,7 @@ export class LlamaCpp implements LLM {
   private rerankModelUri: string;
   private modelCacheDir: string;
   private expandContextSize: number;
+  private expandTimeoutMs: number;
 
   // Ensure we don't load the same model/context concurrently (which can allocate duplicate VRAM).
   private embedModelLoadPromise: Promise<LlamaModel> | null = null;
@@ -506,6 +535,7 @@ export class LlamaCpp implements LLM {
     this.rerankModelUri = config.rerankModel || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
+    this.expandTimeoutMs = resolveExpandTimeoutMs(config.expandTimeoutMs);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
   }
@@ -1161,6 +1191,15 @@ export class LlamaCpp implements LLM {
     });
     const sequence = genContext.getSequence();
     const session = new LlamaChatSession({ contextSequence: sequence });
+    const abortController = new AbortController();
+    let timedOut = false;
+    const timeout = this.expandTimeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          abortController.abort();
+        }, this.expandTimeoutMs)
+      : null;
+    timeout?.unref();
 
     try {
       // Qwen3 recommended settings for non-thinking mode:
@@ -1168,15 +1207,20 @@ export class LlamaCpp implements LLM {
       // DO NOT use greedy decoding (temp=0) - causes infinite loops
       const result = await session.prompt(prompt, {
         grammar,
-        maxTokens: 600,
+        maxTokens: DEFAULT_EXPAND_MAX_TOKENS,
         temperature: 0.7,
         topK: 20,
         topP: 0.8,
+        signal: abortController.signal,
+        stopOnAbortSignal: true,
         repeatPenalty: {
           lastTokens: 64,
           presencePenalty: 0.5,
         },
       });
+      if (timedOut) {
+        process.stderr.write(`QMD Warning: query expansion timed out after ${this.expandTimeoutMs}ms; using partial/fallback expansion.\n`);
+      }
 
       const lines = result.trim().split("\n");
       const queryTerms = query.toLowerCase()
@@ -1217,6 +1261,7 @@ export class LlamaCpp implements LLM {
       if (includeLexical) fallback.unshift({ type: 'lex', text: query });
       return fallback;
     } finally {
+      if (timeout) clearTimeout(timeout);
       await genContext.dispose();
     }
   }

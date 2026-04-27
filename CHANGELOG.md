@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Changes
+
+- `qmd query`, `qmd search`, `qmd vsearch`: add `--path <prefix>` flag (repeatable) to restrict
+  results to a collection-relative path prefix. Multiple `--path` flags are ORed together.
+  Filtering happens at SQL level via `LIKE prefix%` — no overhead when omitted.
+  Example: `qmd query "something" --path 2025/` or `qmd query "x" --path work/ --path personal/`.
+  Also exposed in the SDK as `pathPrefixes?: string[]` on `SearchOptions`, `LexSearchOptions`,
+  and `VectorSearchOptions`.
+
+- CLI/docs: clarify `qmd search` vs `qmd query` (structured `lex:`/`vec:`/`hyde:` only on
+  `query`; collection mask controls indexed extensions; `--no-rerank` / `-C` for latency).
+  BM25 search strips a single leading `lex:` prefix so copy-paste from `query` examples
+  does not require a spurious `lex` keyword match.
+
+- MCP RPC parity: wire `--path`, `--no-rerank`, and `-C/--candidate-limit` through
+  `executeRpcCommand` so MCP command execution matches CLI search/query filtering
+  and latency controls.
+
 ### Fixes
 
 - Fix: `qmd query` now correctly filters query expansions for Russian (Cyrillic)
@@ -10,6 +28,12 @@
   Unicode-aware pattern (`\p{L}\p{N}`). The expansion prompt also receives a
   language hint when the query is Cyrillic, so Qwen3 returns Russian-language
   `lex:`/`vec:` variants instead of English paraphrases.
+- Query expansion: add configurable timeout (`QMD_EXPAND_TIMEOUT_MS`, default 20s)
+  and abort handling so expansion can't hang indefinitely; fallback path returns
+  partial/safe expansions.
+- BM25: prune natural-language filler terms (EN/RU stopwords, very short tokens)
+  for longer plain-language queries and cap positive term fan-out to improve
+  precision for question-style inputs.
 - Embedding: add `QMD_EMBED_SESSION_MAX_DURATION_SEC` env var to override
   `qmd embed` session timeout in seconds (`0` disables timeout), with `.env`
   fallback from the current working directory when running `qmd embed`.

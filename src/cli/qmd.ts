@@ -14,6 +14,7 @@ import {
   resolve,
   enableProductionMode,
   searchFTS,
+  stripLexPrefixForFtsQuery,
   extractSnippet,
   getContextForFile,
   getContextForPath,
@@ -1869,6 +1870,7 @@ type OutputOptions = {
   minScore: number;
   all?: boolean;
   collection?: string | string[];  // Filter by collection name(s)
+  pathPrefixes?: string[];         // Filter by collection-relative path prefix(es)
   lineNumbers?: boolean; // Add line numbers to output
   explain?: boolean;     // Include retrieval score traces (query only)
   context?: string;      // Optional context for query expansion
@@ -2311,7 +2313,7 @@ function search(query: string, opts: OutputOptions): void {
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
   const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection),
+    searchFTS(db, query, fetchLimit, singleCollection, opts.pathPrefixes),
     collectionNames
   );
 
@@ -2333,7 +2335,8 @@ function search(query: string, opts: OutputOptions): void {
     printEmptySearchResults(opts.format);
     return;
   }
-  outputResults(resultsWithContext, query, opts);
+  const displayQuery = stripLexPrefixForFtsQuery(query);
+  outputResults(resultsWithContext, displayQuery, opts);
 }
 
 // Log query expansion as a tree to stderr (CLI progress feedback)
@@ -2364,6 +2367,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   await withLLMSession(async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
+      pathPrefixes: opts.pathPrefixes,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
@@ -2441,6 +2445,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
 
       results = await structuredSearch(store, structuredQueries, {
         collections: singleCollection ? [singleCollection] : undefined,
+        pathPrefixes: opts.pathPrefixes,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2476,6 +2481,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       // Standard hybrid query with automatic expansion
       results = await hybridQuery(store, query, {
         collection: singleCollection,
+        pathPrefixes: opts.pathPrefixes,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2591,6 +2597,7 @@ function parseCLI() {
       json: { type: "boolean" },
       explain: { type: "boolean" },
       collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
+      path: { type: "string", multiple: true },  // Filter by path prefix(es)
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
@@ -2648,6 +2655,7 @@ function parseCLI() {
     minScore: values["min-score"] ? parseFloat(String(values["min-score"])) || 0 : 0,
     all: isAll,
     collection: values.collection as string[] | undefined,
+    pathPrefixes: (values.path as string[] | undefined)?.map(p => p.replace(/\\/g, '/').replace(/^\//, '')),
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
@@ -2800,8 +2808,8 @@ function showHelp(): void {
   console.log("Primary commands:");
   console.log("  qmd query <query>             - Hybrid search with auto expansion + reranking (recommended)");
   console.log("  qmd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)");
-  console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM)");
-  console.log("  qmd vsearch <query>           - Vector similarity only");
+  console.log("  qmd search <query>            - Full-text BM25 keywords (no LLM; no vec:/hyde: grammar)");
+  console.log("  qmd vsearch <query>           - Vector similarity only (no rerank)");
   console.log("  qmd get <file>[:line] [-l N]  - Show a single document, optional line slice");
   console.log("  qmd multi-get <pattern>       - Batch fetch via glob or comma-separated list");
   console.log("  qmd skill show/install        - Show or install the packaged QMD skill");
@@ -2820,6 +2828,13 @@ function showHelp(): void {
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
+  console.log("");
+  console.log("qmd search vs qmd query:");
+  console.log("  - search: BM25 only. Use plain keywords; structured lex:/vec:/hyde: lines are for");
+  console.log("    qmd query only. Leading lex: on one line is accepted as alias for the rest.");
+  console.log("  - Indexed files = collection glob only; extend mask (e.g. *.xml) then qmd update");
+  console.log("    if you need those files in the index.");
+  console.log("  - query: use --no-rerank or -C <n> for lower latency when rerank is too slow.");
   console.log("");
   console.log("Query syntax (qmd query):");
   console.log("  QMD queries are either a single expand query (no prefix) or a multi-line");
@@ -2877,6 +2892,7 @@ function showHelp(): void {
   console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
+  console.log("  --path <prefix>            - Restrict to collection-relative path prefix; repeatable (OR)");
   console.log("");
   console.log("Embed/query options:");
   console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");

@@ -37,6 +37,23 @@ qmd mcp --http --daemon           # Start as background daemon
 qmd mcp stop                      # Stop background MCP daemon
 ```
 
+## Search vs query (agents)
+
+- **`qmd query`** — hybrid pipeline: optional expand, `lex:` / `vec:` / `hyde:` **structured query document** (multi-line or typed lines), RRF fusion, LLM rerank. **`lex:` / `vec:` / `hyde:` / `intent:` apply only here**, not to `search`.
+- **`qmd search`** — BM25 (FTS) on indexed files only: pass **plain keywords** (phrases in `"quotes"`, `-negation` per FTS lexer). A single leading **`lex:`** is stripped for convenience (same as keywords after it); **`vec:`** / **`hyde:`** are not structured here — use **`qmd query`**.
+- **`qmd vsearch`** — vector similarity only (no rerank stage like `query`).
+- **Latency** — `qmd query --no-rerank` and `-C <n>` / `--candidate-limit` reduce rerank cost; wide `query` + full rerank can be tens of seconds on CPU.
+- **Path filter** — `--path <prefix>` restricts results to a collection-relative path prefix without creating separate collections. Repeatable (OR logic). Filtering is at SQL level (`LIKE prefix%`) — no cost when omitted. Works with `query`, `search`, `vsearch`. Leading `/` is stripped automatically.
+
+  ```sh
+  qmd query "something" --path 2025/
+  qmd query "something" --path work/ --path personal/
+  qmd search "keyword" --path docs/api/
+  qmd vsearch "concept" -c mycollection --path archive/2024/
+  ```
+
+- **Collection mask** — only paths matching the collection glob are indexed. Example: mask `**/*.{md,bsl}` excludes `*.xml` (e.g. 1C `Form.xml`); add `xml` to the mask and run `qmd update` if those files must be searchable.
+
 ## Collection Management
 
 ```sh
@@ -110,11 +127,13 @@ qmd multi-get "#abc123, #def456"
 ```sh
 # Search & retrieval
 -c, --collection <name>  # Restrict search to a collection (matches pwd suffix)
+--path <prefix>          # Restrict to collection-relative path prefix (repeatable, OR logic)
 -n <num>                 # Number of results
 --all                    # Return all matches
 --min-score <num>        # Minimum score threshold
 --full                   # Show full document content
 --line-numbers           # Add line numbers to output
+# query only: --no-rerank, -C / --candidate-limit (faster; skips LLM rerank or fewer candidates)
 
 # Multi-get specific
 -l <num>                 # Maximum lines per file

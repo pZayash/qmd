@@ -1126,8 +1126,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string, pathPrefixes?: string[]) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefixes?: string[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1668,8 +1668,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchFTS: (query: string, limit?: number, collectionName?: string, pathPrefixes?: string[]) => searchFTS(db, query, limit, collectionName, pathPrefixes),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefixes?: string[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, pathPrefixes),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent, store.llm),
@@ -2951,6 +2951,12 @@ function buildFTS5Query(query: string): string | null {
 
   let i = 0;
   const s = query.trim();
+  const naturalLanguageStopwords = new Set([
+    "a", "an", "and", "are", "as", "for", "how", "in", "is", "of", "on", "or", "the", "to", "what", "where", "why",
+    "в", "во", "где", "для", "и", "как", "на", "о", "об", "по", "получить", "с", "у", "что",
+  ]);
+  const plainTokenCount = s.split(/\s+/).filter(Boolean).length;
+  const pruneNaturalLanguage = plainTokenCount > 3 && !s.includes('"') && !/(^|\s)-\S/.test(s);
 
   while (i < s.length) {
     // Skip whitespace
@@ -3000,6 +3006,9 @@ function buildFTS5Query(query: string): string | null {
       } else {
         const sanitized = sanitizeFTS5Term(term);
         if (sanitized) {
+          if (pruneNaturalLanguage && (sanitized.length < 3 || naturalLanguageStopwords.has(sanitized))) {
+            continue;
+          }
           const ftsTerm = `"${sanitized}"*`;  // Prefix match
           if (negated) {
             negative.push(ftsTerm);
@@ -3015,6 +3024,10 @@ function buildFTS5Query(query: string): string | null {
 
   // If only negative terms, we can't search (FTS5 NOT is binary)
   if (positive.length === 0) return null;
+
+  if (pruneNaturalLanguage && positive.length > 4) {
+    positive.length = 4;
+  }
 
   // Join positive terms with AND
   let result = positive.join(' AND ');
@@ -3050,7 +3063,39 @@ export function validateLexQuery(query: string): string | null {
   return null;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+/**
+ * Strip a single leading `lex:` prefix from a BM25 search string.
+ * `qmd query` uses `lex:` as structured syntax; `qmd search` feeds the string
+ * directly to FTS. Copy-paste like `lex: foo` would otherwise require a literal
+ * `lex` token match (often empty results).
+ */
+export function stripLexPrefixForFtsQuery(query: string): string {
+  const t = query.trim();
+  if (/^lex:\s*/i.test(t)) {
+    return t.replace(/^lex:\s*/i, "").trim();
+  }
+  return query;
+}
+
+function normalizePathPrefix(prefix: string): string {
+  return prefix.replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
+function fileMatchesPathPrefixes(file: string, pathPrefixes?: string[]): boolean {
+  if (!pathPrefixes?.length) return true;
+  const normalizedPrefixes = pathPrefixes
+    .map(normalizePathPrefix)
+    .filter(prefix => prefix.length > 0);
+  if (normalizedPrefixes.length === 0) return true;
+
+  const parsed = parseVirtualPath(file);
+  const relPath = parsed?.path ?? file.replace(/^qmd:\/\/[^/]+\//, '');
+  const normalizedPath = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
+  return normalizedPrefixes.some(prefix => normalizedPath.startsWith(prefix));
+}
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string, pathPrefixes?: string[]): SearchResult[] {
+  query = stripLexPrefixForFtsQuery(query);
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
@@ -3059,20 +3104,40 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   // collection filter in a single WHERE clause, which can cause it to
   // abandon the FTS5 index and fall back to a full scan — turning an 8ms
   // query into a 17-second query on large collections.
-  const params: (string | number)[] = [ftsQuery];
+  const ftsWhere: string[] = [`documents_fts MATCH ?`];
+  const ftsParams: (string | number)[] = [ftsQuery];
+  const docFilters: string[] = [`d_filter.active = 1`];
+  const docFilterParams: string[] = [];
 
-  // When filtering by collection, fetch extra candidates from the FTS index
-  // since some will be filtered out. Without a collection filter we can
-  // fetch exactly the requested limit.
-  const ftsLimit = collectionName ? limit * 10 : limit;
+  if (collectionName) {
+    docFilters.push(`d_filter.collection = ?`);
+    docFilterParams.push(String(collectionName));
+  }
+
+  if (pathPrefixes?.length) {
+    const clauses = pathPrefixes.map(() => `d_filter.path LIKE ? || '%'`).join(' OR ');
+    docFilters.push(`(${clauses})`);
+    docFilterParams.push(...pathPrefixes);
+  }
+
+  if (docFilters.length > 1) {
+    ftsWhere.push(`
+      rowid IN (
+        SELECT d_filter.id
+        FROM documents d_filter
+        WHERE ${docFilters.join(' AND ')}
+      )
+    `);
+    ftsParams.push(...docFilterParams);
+  }
 
   let sql = `
     WITH fts_matches AS (
       SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
       FROM documents_fts
-      WHERE documents_fts MATCH ?
+      WHERE ${ftsWhere.join(' AND ')}
       ORDER BY bm25_score ASC
-      LIMIT ${ftsLimit}
+      LIMIT ?
     )
     SELECT
       'qmd://' || d.collection || '/' || d.path as filepath,
@@ -3086,11 +3151,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     JOIN content ON content.hash = d.hash
     WHERE d.active = 1
   `;
-
-  if (collectionName) {
-    sql += ` AND d.collection = ?`;
-    params.push(String(collectionName));
-  }
+  const params: (string | number)[] = [...ftsParams, limit];
 
   // bm25 lower is better; sort ascending.
   sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
@@ -3125,7 +3186,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefixes?: string[]): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -3138,11 +3199,13 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // See: https://github.com/tobi/qmd/pull/23
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
+  // Inflate k when path-filtering: most ANN candidates may not match the narrow prefix
+  const vecK = pathPrefixes?.length ? limit * 30 : limit * 3;
   const vecResults = db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  `).all(new Float32Array(embedding), vecK) as { hash_seq: string; distance: number }[];
 
   if (vecResults.length === 0) return [];
 
@@ -3173,6 +3236,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
     params.push(collectionName);
   }
 
+  if (pathPrefixes?.length) {
+    const clauses = pathPrefixes.map(() => `d.path LIKE ? || '%'`).join(' OR ');
+    docSql += ` AND (${clauses})`;
+    params.push(...pathPrefixes);
+  }
+
   const docRows = db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
     display_path: string; title: string; body: string;
@@ -3190,7 +3259,6 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   return Array.from(seen.values())
     .sort((a, b) => a.bestDist - b.bestDist)
-    .slice(0, limit)
     .map(({ row, bestDist }) => {
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
       return {
@@ -3208,7 +3276,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
         source: "vec" as const,
         chunkPos: row.pos,
       };
-    });
+    })
+    .filter(r => fileMatchesPathPrefixes(r.filepath, pathPrefixes))
+    .slice(0, limit);
 }
 
 // =============================================================================
@@ -3987,6 +4057,7 @@ export interface SearchHooks {
 
 export interface HybridQueryOptions {
   collection?: string;
+  pathPrefixes?: string[];  // restrict to collection-relative path prefixes
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -4038,6 +4109,7 @@ export async function hybridQuery(
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const collection = options?.collection;
+  const pathPrefixes = options?.pathPrefixes;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
@@ -4055,7 +4127,7 @@ export async function hybridQuery(
   // match may not be what the caller wants (e.g. "performance" with intent
   // "web page load times" should NOT shortcut to a sports-performance doc).
   // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
-  const initialFts = store.searchFTS(query, 20, collection);
+  const initialFts = store.searchFTS(query, 20, collection, pathPrefixes);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
   const hasStrongSignal = !intent && initialFts.length > 0
@@ -4092,7 +4164,7 @@ export async function hybridQuery(
   // 3a: Run FTS for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.query, 20, collection);
+      const ftsResults = store.searchFTS(q.query, 20, collection, pathPrefixes);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
@@ -4130,7 +4202,7 @@ export async function hybridQuery(
 
       const vecResults = await store.searchVec(
         vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
-        undefined, embedding
+        undefined, embedding, pathPrefixes
       );
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
@@ -4228,6 +4300,7 @@ export async function hybridQuery(
         seenFiles.add(r.file);
         return true;
       })
+      .filter(r => fileMatchesPathPrefixes(r.file, pathPrefixes))
       .filter(r => r.score >= minScore)
       .slice(0, limit);
   }
@@ -4306,12 +4379,14 @@ export async function hybridQuery(
       seenFiles.add(r.file);
       return true;
     })
+    .filter(r => fileMatchesPathPrefixes(r.file, pathPrefixes))
     .filter(r => r.score >= minScore)
     .slice(0, limit);
 }
 
 export interface VectorSearchOptions {
   collection?: string;
+  pathPrefixes?: string[];  // restrict to collection-relative path prefixes
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
@@ -4345,6 +4420,7 @@ export async function vectorSearchQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
   const collection = options?.collection;
+  const pathPrefixes = options?.pathPrefixes;
   const intent = options?.intent;
 
   const hasVectors = !!store.db.prepare(
@@ -4362,7 +4438,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
+    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection, undefined, undefined, pathPrefixes);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -4381,6 +4457,7 @@ export async function vectorSearchQuery(
 
   return Array.from(allResults.values())
     .sort((a, b) => b.score - a.score)
+    .filter(r => fileMatchesPathPrefixes(r.file, pathPrefixes))
     .filter(r => r.score >= minScore)
     .slice(0, limit);
 }
@@ -4395,6 +4472,7 @@ export async function vectorSearchQuery(
  */
 export interface StructuredSearchOptions {
   collections?: string[];   // Filter to specific collections (OR match)
+  pathPrefixes?: string[];  // restrict to collection-relative path prefixes
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -4439,6 +4517,7 @@ export async function structuredSearch(
   const hooks = options?.hooks;
 
   const collections = options?.collections;
+  const pathPrefixes = options?.pathPrefixes;
 
   if (searches.length === 0) return [];
 
@@ -4475,7 +4554,7 @@ export async function structuredSearch(
   for (const search of searches) {
     if (search.type === 'lex') {
       for (const coll of collectionList) {
-        const ftsResults = store.searchFTS(search.query, 20, coll);
+        const ftsResults = store.searchFTS(search.query, 20, coll, pathPrefixes);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({
@@ -4513,7 +4592,7 @@ export async function structuredSearch(
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
             vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
-            undefined, embedding
+            undefined, embedding, pathPrefixes
           );
           if (vecResults.length > 0) {
             for (const r of vecResults) docidMap.set(r.filepath, r.docid);
@@ -4620,6 +4699,7 @@ export async function structuredSearch(
         seenFiles.add(r.file);
         return true;
       })
+      .filter(r => fileMatchesPathPrefixes(r.file, pathPrefixes))
       .filter(r => r.score >= minScore)
       .slice(0, limit);
   }
@@ -4697,6 +4777,7 @@ export async function structuredSearch(
       seenFiles.add(r.file);
       return true;
     })
+    .filter(r => fileMatchesPathPrefixes(r.file, pathPrefixes))
     .filter(r => r.score >= minScore)
     .slice(0, limit);
 }

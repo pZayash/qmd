@@ -55,6 +55,7 @@ import {
   type DocumentResult,
   type SearchResult,
   type RankedResult,
+  stripLexPrefixForFtsQuery,
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
 
@@ -1148,6 +1149,25 @@ describe("FTS Search", () => {
     await cleanupTestDb(store);
   });
 
+  test("searchFTS strips leading lex: prefix (same hits as plain keywords)", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+    await insertTestDocument(store.db, collectionName, {
+      name: "doc1",
+      title: "Fox Document",
+      body: "The quick brown fox jumps over the lazy dog",
+      displayPath: "test/doc1.md",
+    });
+
+    const plain = store.searchFTS("fox", 10);
+    const withLex = store.searchFTS("lex: fox", 10);
+    expect(withLex.length).toBe(plain.length);
+    expect(withLex[0]?.displayPath).toBe(plain[0]?.displayPath);
+    expect(stripLexPrefixForFtsQuery("lex:  fox")).toBe("fox");
+
+    await cleanupTestDb(store);
+  });
+
   test("searchFTS ranks title matches higher", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -1265,6 +1285,25 @@ describe("FTS Search", () => {
     const results = store.searchFTS("foo(bar)", 10);
     // Results may vary based on FTS5 handling
     expect(Array.isArray(results)).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchFTS prunes natural-language filler terms", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "random-number",
+      title: "Random Number",
+      body: "Случайное число возвращается методом генератора.",
+      displayPath: "docs/random-number.md",
+    });
+
+    const results = store.searchFTS("Как получить случайное число в 1С?", 10, collectionName);
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]!.displayPath).toBe(`${collectionName}/docs/random-number.md`);
 
     await cleanupTestDb(store);
   });
@@ -2255,6 +2294,76 @@ describe("Vector Table", () => {
       SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'
     `).get() as { sql: string };
     expect(tableInfoAfter.sql).toContain("float[768]");
+
+    await cleanupTestDb(store);
+  });
+});
+
+// =============================================================================
+// Path Prefix Filtering Tests
+// =============================================================================
+
+describe("Path Prefix Filtering", () => {
+  test("searchFTS applies path filter before limiting FTS candidates", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ name: "paths", pwd: "/test/paths" });
+
+    for (let i = 0; i < 600; i++) {
+      await insertTestDocument(store.db, collectionName, {
+        name: `conf-${i}`,
+        displayPath: `conf/doc-${i}.md`,
+        body: "randomtoken appears in config",
+      });
+    }
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "help-random",
+      displayPath: "docs/1c-help/random.md",
+      body: "randomtoken appears in help",
+    });
+
+    const results = store.searchFTS("randomtoken", 5, collectionName, ["docs/1c-help/"]);
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.every(r => r.filepath.startsWith(`qmd://${collectionName}/docs/1c-help/`))).toBe(true);
+
+    await cleanupTestDb(store);
+  });
+
+  test("searchVec respects path prefixes with precomputed embedding", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ name: "vecpaths", pwd: "/test/vecpaths" });
+
+    const confHash = "confhash123";
+    const docsHash = "docshash123";
+
+    await insertTestDocument(store.db, collectionName, {
+      name: "conf-vector",
+      hash: confHash,
+      displayPath: "conf/random.md",
+      body: "config vector document",
+    });
+    await insertTestDocument(store.db, collectionName, {
+      name: "docs-vector",
+      hash: docsHash,
+      displayPath: "docs/1c-help/random.md",
+      body: "help vector document",
+    });
+
+    store.ensureVecTable(3);
+    const now = new Date().toISOString();
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(confHash, now);
+    store.db.prepare(`INSERT INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, 0, 0, 'test', ?)`).run(docsHash, now);
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${confHash}_0`, new Float32Array([0.9, 0.1, 0]));
+    store.db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`).run(`${docsHash}_0`, new Float32Array([0.95, 0.05, 0]));
+
+    const docsResults = await store.searchVec("random", "test", 10, collectionName, undefined, [1, 0, 0], ["docs/1c-help/"]);
+    const confResults = await store.searchVec("random", "test", 10, collectionName, undefined, [1, 0, 0], ["conf/"]);
+
+    expect(docsResults).toHaveLength(1);
+    expect(docsResults[0]!.filepath).toBe(`qmd://${collectionName}/docs/1c-help/random.md`);
+    expect(confResults).toHaveLength(1);
+    expect(confResults[0]!.filepath).toBe(`qmd://${collectionName}/conf/random.md`);
 
     await cleanupTestDb(store);
   });
