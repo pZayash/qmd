@@ -24,9 +24,11 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
+  type LLM,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
+import { OpenRouterEmbedding } from "./llm-openrouter.js";
 import type {
   NamedCollection,
   Collection,
@@ -63,8 +65,89 @@ export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
  * Get the LlamaCpp instance for a store — prefers the store's own instance,
  * falls back to the global singleton.
  */
-function getLlm(store: Store): LlamaCpp {
+function getLlm(store: Store): LLM {
   return store.llm ?? getDefaultLlamaCpp();
+}
+
+// Module-level cache: model URI → LLM instance (avoids recreating LlamaCpp per query)
+const _fallbackLlmCache = new Map<string, LLM>();
+
+/**
+ * Query which embedding model was used to index a collection's vectors.
+ * Pass undefined collectionName to check any collection in the DB.
+ * Returns null if no vectors exist yet.
+ */
+function getCollectionEmbedModel(db: Database, collectionName?: string): string | null {
+  try {
+    const tableExists = db.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name='content_vectors'`
+    ).get();
+    if (!tableExists) return null;
+
+    const row = collectionName
+      ? db.prepare(`
+          SELECT cv.model FROM content_vectors cv
+          JOIN documents d ON d.hash = cv.hash
+          WHERE d.collection = ?
+          LIMIT 1
+        `).get(collectionName) as { model: string } | undefined
+      : db.prepare(`SELECT model FROM content_vectors LIMIT 1`).get() as { model: string } | undefined;
+
+    return row?.model ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get or create a cached LLM for the given embed model URI.
+ * OpenRouter URIs → OpenRouterEmbedding; everything else → LlamaCpp.
+ */
+function getOrCreateLlmForModel(modelUri: string): LLM {
+  const cached = _fallbackLlmCache.get(modelUri);
+  if (cached) return cached;
+
+  const llm: LLM = modelUri.startsWith("openrouter:")
+    ? new OpenRouterEmbedding(modelUri)
+    : new LlamaCpp({ embedModel: modelUri });
+
+  _fallbackLlmCache.set(modelUri, llm);
+  return llm;
+}
+
+/**
+ * Resolve which LLM to use for query embedding given the target collection(s).
+ *
+ * If the collection(s) were indexed with a different model than the current LLM,
+ * returns a cached LLM that matches the indexed model (with a one-time warning).
+ * This prevents dimension mismatches between query embeddings and stored vectors.
+ *
+ * Pass undefined entries for "all collections" (no filter).
+ */
+function resolveLlmForCollections(store: Store, collectionNames: (string | undefined)[]): LLM {
+  const currentLlm = getLlm(store);
+
+  const indexedModels = new Set<string>();
+  for (const name of collectionNames) {
+    const m = getCollectionEmbedModel(store.db, name);
+    if (m) indexedModels.add(m);
+  }
+
+  if (indexedModels.size === 0) return currentLlm; // no vectors yet
+
+  if (indexedModels.size > 1) {
+    // Multiple models across collections — can't pick one, use current and let sqlite-vec filter mismatches
+    return currentLlm;
+  }
+
+  const [indexedModel] = indexedModels;
+  if (indexedModel === currentLlm.embedModelName) return currentLlm;
+
+  console.warn(
+    `⚠ Index built with "${indexedModel}", current embed model is "${currentLlm.embedModelName}". ` +
+    `Using indexed model for query embedding. Run 'qmd embed --reindex' to migrate.`
+  );
+  return getOrCreateLlmForModel(indexedModel!);
 }
 
 // =============================================================================
@@ -1088,8 +1171,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional LLM instance for this store (overrides the global singleton) */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -2365,7 +2448,11 @@ export async function chunkDocumentByTokens(
       || subChunks[0]?.text.length === text.length
     ) {
       const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
-      const truncatedText = await llm.detokenize(fallbackTokens);
+      // LlamaCpp can detokenize precisely; other backends fall back to char truncation.
+      // Cast needed: LlamaToken is a branded number; runtime values are plain integers.
+      const truncatedText = llm instanceof LlamaCpp
+        ? await llm.detokenize(fallbackTokens as any)
+        : text.slice(0, Math.round(text.length * (maxTokens / Math.max(1, tokens.length))));
       results.push({
         text: truncatedText,
         pos,
@@ -3285,7 +3372,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
@@ -3354,7 +3441,7 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -3393,7 +3480,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
@@ -4188,7 +4275,7 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getLlm(store);
+    const llm = resolveLlmForCollections(store, [collection]);
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, llm.embedModelName));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
@@ -4435,10 +4522,13 @@ export async function vectorSearchQuery(
   options?.hooks?.onExpand?.(query, vecExpanded, Date.now() - expandStart);
 
   // Run original + vec/hyde expanded through vector, sequentially — concurrent embed() hangs
+  const llm = resolveLlmForCollections(store, [collection]);
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
-  for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection, undefined, undefined, pathPrefixes);
+  const embeddings = await llm.embedBatch(queryTexts.map(t => formatQueryForEmbedding(t, llm.embedModelName)));
+  for (let i = 0; i < queryTexts.length; i++) {
+    const precomputed = embeddings[i]?.embedding;
+    const vecResults = await store.searchVec(queryTexts[i]!, llm.embedModelName, limit, collection, undefined, precomputed, pathPrefixes);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -4578,7 +4668,7 @@ export async function structuredSearch(
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getLlm(store);
+      const llm = resolveLlmForCollections(store, collectionList);
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, llm.embedModelName));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();

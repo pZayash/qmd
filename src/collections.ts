@@ -40,6 +40,7 @@ export interface ModelsConfig {
   embed?: string;
   rerank?: string;
   generate?: string;
+  embedBatchSize?: number;
 }
 
 /**
@@ -140,6 +141,45 @@ function ensureConfigDir(): void {
 // ============================================================================
 // Core functions
 // ============================================================================
+
+/**
+ * Load secrets from ~/.config/qmd/.env into process.env.
+ * Existing env vars take priority (are not overwritten).
+ * Called once at CLI/SDK startup.
+ */
+export function loadConfigEnv(): void {
+  const envPath = join(getConfigDir(), ".env");
+  if (!existsSync(envPath)) return;
+
+  let content: string;
+  try {
+    content = readFileSync(envPath, "utf-8");
+  } catch {
+    return;
+  }
+
+  for (const rawLine of content.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const eqIdx = line.indexOf("=");
+    if (eqIdx < 1) continue;
+
+    const key = line.slice(0, eqIdx).trim();
+    let value = line.slice(eqIdx + 1).trim();
+
+    // Strip surrounding quotes (single or double)
+    if ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+
+    // Env vars already set in the environment take priority
+    if (key && !(key in process.env)) {
+      process.env[key] = value;
+    }
+  }
+}
 
 /**
  * Load configuration from the configured source.

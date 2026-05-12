@@ -66,10 +66,13 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  type LLM,
 } from "./llm.js";
+import { OpenRouterEmbedding } from "./llm-openrouter.js";
 import {
   setConfigSource,
   loadConfig,
+  loadConfigEnv,
   addCollection as collectionsAddCollection,
   removeCollection as collectionsRemoveCollection,
   renameCollection as collectionsRenameCollection,
@@ -347,6 +350,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     throw new Error("Provide either configPath or config, not both");
   }
 
+  // Load secrets from ~/.config/qmd/.env before reading config or creating LLM
+  loadConfigEnv();
+
   // Create the internal store (opens DB, creates tables)
   const internal = createStoreInternal(options.dbPath);
   const db = internal.db;
@@ -369,15 +375,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
-    embedModel: config?.models?.embed,
-    generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
-  });
+  // Create per-store LLM instance. Use OpenRouter when embed URI starts with 'openrouter:',
+  // otherwise use local LlamaCpp (lazy-loads models, auto-unloads after 5 min inactivity).
+  const embedUri = config?.models?.embed;
+  const llm: LLM = embedUri?.startsWith("openrouter:")
+    ? new OpenRouterEmbedding(embedUri, { batchSize: config?.models?.embedBatchSize })
+    : new LlamaCpp({
+        embedModel: embedUri,
+        generateModel: config?.models?.generate,
+        rerankModel: config?.models?.rerank,
+        inactivityTimeoutMs: 5 * 60 * 1000,
+        disposeModelsOnInactivity: true,
+      });
   internal.llm = llm;
 
   const store: QMDStore = {

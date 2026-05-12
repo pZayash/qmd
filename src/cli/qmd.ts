@@ -82,6 +82,7 @@ import {
   type ChunkStrategy,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { OpenRouterEmbedding } from "../llm-openrouter.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -101,6 +102,7 @@ import {
   listAllContexts,
   setConfigIndexName,
   loadConfig,
+  loadConfigEnv,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
 
@@ -124,11 +126,16 @@ function getStore(): ReturnType<typeof createStore> {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
       if (config.models) {
-        setDefaultLlamaCpp(new LlamaCpp({
-          embedModel: config.models.embed,
-          generateModel: config.models.generate,
-          rerankModel: config.models.rerank,
-        }));
+        const embedUri = config.models.embed;
+        if (embedUri?.startsWith("openrouter:")) {
+          setDefaultLlamaCpp(new OpenRouterEmbedding(embedUri, { batchSize: config.models?.embedBatchSize }));
+        } else {
+          setDefaultLlamaCpp(new LlamaCpp({
+            embedModel: embedUri,
+            generateModel: config.models.generate,
+            rerankModel: config.models.rerank,
+          }));
+        }
       }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
@@ -479,9 +486,11 @@ async function showStatus(): Promise<void> {
 
   // Device / GPU info
   console.log(`\n${c.bold}Device${c.reset}`);
-  try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo({ allowBuild: false });
+  const _defaultLlm = getDefaultLlamaCpp();
+  if (!(_defaultLlm instanceof LlamaCpp)) {
+    console.log(`  Status:   ${c.dim}n/a${c.reset} (cloud embedding backend — no local GPU)`);
+  } else try {
+    const device = await _defaultLlm.getDeviceInfo({ allowBuild: false });
     if (device.gpu) {
       console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
       if (device.gpuDevices.length > 0) {
@@ -1427,6 +1436,18 @@ function collectionList(): void {
     }
     console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
     console.log(`  ${c.dim}Updated:${c.reset}  ${timeAgo}`);
+
+    // Show embedding model(s) used to index this collection
+    const embedModels = (db.prepare(`
+      SELECT DISTINCT cv.model
+      FROM content_vectors cv
+      JOIN documents d ON d.hash = cv.hash
+      WHERE d.collection = ? AND d.active = 1
+    `).all(coll.name) as { model: string }[]).map(r => r.model);
+    if (embedModels.length > 0) {
+      console.log(`  ${c.dim}Embed:${c.reset}    ${embedModels.join(', ')}`);
+    }
+
     console.log();
   }
 
@@ -3033,6 +3054,9 @@ const isMain = argv1 === __filename
   || argv1?.endsWith("/qmd.js")
   || (argv1 != null && realpathSync(argv1) === __filename);
 if (isMain) {
+  // Load secrets from ~/.config/qmd/.env before anything else
+  loadConfigEnv();
+
   const cli = parseCLI();
 
   if (cli.values.version) {
