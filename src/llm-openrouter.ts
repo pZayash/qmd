@@ -44,6 +44,10 @@ export class OpenRouterEmbedding implements LLM {
     return this.uri;
   }
 
+  get preferredEmbedBatchSize(): number {
+    return this.batchSize;
+  }
+
   private async callEmbeddings(input: string | string[]): Promise<OpenRouterEmbeddingResponse> {
     const resp = await fetch(OPENROUTER_EMBEDDINGS_URL, {
       method: "POST",

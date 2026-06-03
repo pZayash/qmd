@@ -110,6 +110,45 @@ export function handler${i}(req: Request, res: Response): void {
     expect(astSplits).toBeLessThanOrEqual(regexSplits);
   });
 
+  test("AST splits fewer BSL procedures across chunk boundaries than regex", async () => {
+    const parts: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      parts.push(`
+Процедура Обработчик${i}(Параметр1, Параметр2) Экспорт
+    Если НЕ ЗначениеЗаполнено(Параметр1) Тогда
+        ВызватьИсключение "Ошибка";
+    КонецЕсли;
+${Array.from({ length: 12 }, (_, j) => `    Результат${j} = Параметр1 + Параметр2 + ${i} + ${j};`).join("\n")}
+КонецПроцедуры
+`);
+    }
+    const largeBSL = parts.join("\n");
+
+    function countSplitProcedures(chunks: { text: string; pos: number }[]): number {
+      let splits = 0;
+      for (let i = 0; i < 30; i++) {
+        const procStart = largeBSL.indexOf(`Процедура Обработчик${i}(`);
+        const nextProc = largeBSL.indexOf(`Процедура Обработчик${i + 1}(`, procStart + 1);
+        const procEnd = nextProc > 0 ? nextProc : largeBSL.length;
+        const chunkIndices = new Set<number>();
+        for (let ci = 0; ci < chunks.length; ci++) {
+          const chunkStart = chunks[ci]!.pos;
+          const chunkEnd = chunkStart + chunks[ci]!.text.length;
+          if (chunkStart < procEnd && chunkEnd > procStart) {
+            chunkIndices.add(ci);
+          }
+        }
+        if (chunkIndices.size > 1) splits++;
+      }
+      return splits;
+    }
+
+    const regexChunks = chunkDocument(largeBSL);
+    const astChunks = await chunkDocumentAsync(largeBSL, undefined, undefined, undefined, "handlers.bsl", "auto");
+
+    expect(countSplitProcedures(astChunks)).toBeLessThanOrEqual(countSplitProcedures(regexChunks));
+  });
+
   test("markdown files produce identical chunks in auto vs regex mode", async () => {
     const sections: string[] = [];
     for (let i = 0; i < 15; i++) {

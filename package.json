@@ -17,6 +17,7 @@
   "files": [
     "bin/",
     "dist/",
+    "assets/grammars/",
     "LICENSE",
     "CHANGELOG.md"
   ],
@@ -31,7 +32,8 @@
     "vsearch": "tsx src/cli/qmd.ts vsearch",
     "rerank": "tsx src/cli/qmd.ts rerank",
     "inspector": "npx @modelcontextprotocol/inspector tsx src/cli/qmd.ts mcp",
-    "release": "./scripts/release.sh"
+    "release": "./scripts/release.sh",
+    "build:bsl-wasm": "node scripts/build-bsl-wasm.mjs"
   },
   "publishConfig": {
     "access": "public"
@@ -68,6 +70,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",
+    "tree-sitter-bsl": "0.1.7",
     "tsx": "4.21.0",
     "vitest": "3.2.4"
   },

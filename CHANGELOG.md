@@ -4,6 +4,14 @@
 
 ### Changes
 
+- AST chunking: add BSL (1C) support for `.bsl` and `.osl` via vendored
+  `tree-sitter-bsl` wasm ([alkoleft/tree-sitter-bsl](https://github.com/alkoleft/tree-sitter-bsl)
+  0.1.7). Break points at `procedure_definition`, `function_definition`, and
+  `var_definition`. Enable with `qmd embed --chunk-strategy auto` / `qmd query
+  --chunk-strategy auto`; re-run `qmd embed` (use `-f` if needed) after upgrading.
+  Regenerate wasm: `pnpm run build:bsl-wasm` (needs `tree-sitter-bsl` dev install).
+  SDBL (`.sdbl`) not included.
+
 - `qmd query`, `qmd search`, `qmd vsearch`: add `--path <prefix>` flag (repeatable) to restrict
   results to a collection-relative path prefix. Multiple `--path` flags are ORed together.
   Filtering happens at SQL level via `LIKE prefix%` — no overhead when omitted.

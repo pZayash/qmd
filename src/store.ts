@@ -1552,7 +1552,7 @@ export async function generateEmbeddings(
     let bytesProcessed = 0;
     let totalChunks = 0;
     let vectorTableInitialized = false;
-    const BATCH_SIZE = 32;
+    const BATCH_SIZE = llm.preferredEmbedBatchSize ?? 32;
     const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
     for (const batchMeta of batches) {
@@ -1641,7 +1641,7 @@ export async function generateEmbeddings(
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
             if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), embedModelUri, now);
               chunksEmbedded++;
             } else {
               errors++;
@@ -1660,7 +1660,7 @@ export async function generateEmbeddings(
                 const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
                 const result = await session.embed(text, { model });
                 if (result) {
-                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), embedModelUri, now);
                   chunksEmbedded++;
                 } else {
                   errors++;

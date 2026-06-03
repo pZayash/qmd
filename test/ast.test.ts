@@ -46,6 +46,11 @@ describe("detectLanguage", () => {
     expect(detectLanguage("src/auth.rs")).toBe("rust");
   });
 
+  test("recognizes BSL extensions", () => {
+    expect(detectLanguage("CommonModules/ОбщегоНазначения/Module.bsl")).toBe("bsl");
+    expect(detectLanguage("scripts/main.osl")).toBe("bsl");
+  });
+
   test("returns null for markdown", () => {
     expect(detectLanguage("docs/README.md")).toBeNull();
   });
@@ -285,6 +290,49 @@ fn hash_password(password: &str) -> String {
     expect(structPoint?.score).toBe(100);
     expect(implPoint?.score).toBe(100);
     expect(traitPoint?.score).toBe(100);
+  });
+});
+
+// =============================================================================
+// AST Break Points - BSL (1C)
+// =============================================================================
+
+describe("getASTBreakPoints - BSL", () => {
+  const BSL_SAMPLE = `
+Перем Счетчик Экспорт;
+
+Процедура Привет() Экспорт
+    Сообщить("Привет, мир!");
+КонецПроцедуры
+
+Функция Сложить(А, Б) Экспорт
+    Возврат А + Б;
+КонецФункции
+`;
+
+  test("produces break points at procedure and function boundaries", async () => {
+    const points = await getASTBreakPoints(BSL_SAMPLE, "Module.bsl");
+    const types = points.map(p => p.type);
+
+    expect(points.length).toBeGreaterThan(0);
+    expect(types.some(t => t.includes("func"))).toBe(true);
+    expect(types.some(t => t.includes("type"))).toBe(true);
+  });
+
+  test("procedure and function captures score 90", async () => {
+    const points = await getASTBreakPoints(BSL_SAMPLE, "Module.bsl");
+    const funcPoints = points.filter(p => p.type === "ast:func");
+    expect(funcPoints.length).toBeGreaterThanOrEqual(2);
+    for (const p of funcPoints) {
+      expect(p.score).toBe(90);
+    }
+  });
+
+  test("break points are sorted by position", async () => {
+    const points = await getASTBreakPoints(BSL_SAMPLE, "Module.bsl");
+    for (let i = 1; i < points.length; i++) {
+      expect(points[i]!.pos).toBeGreaterThanOrEqual(points[i - 1]!.pos);
+    }
   });
 });
 

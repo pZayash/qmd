@@ -12,14 +12,14 @@
  * Grammar packages (tree-sitter-typescript, etc.) are listed as
  * optionalDependencies with pinned versions. They ship native prebuilds
  * and source files (~72 MB total) but QMD only uses the .wasm files
- * (~5 MB). If install size becomes a concern, the .wasm files can be
- * bundled directly in the repo (e.g. assets/grammars/) and resolved
- * via import.meta.url instead of require.resolve(), eliminating the
- * grammar packages entirely.
+ * (~5 MB). BSL uses a vendored wasm under assets/grammars/ because
+ * tree-sitter-bsl npm does not ship prebuilt wasm (regenerate via
+ * `pnpm run build:bsl-wasm`).
  */
 
 import { createRequire } from "node:module";
-import { extname } from "node:path";
+import { dirname, extname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { BreakPoint } from "./store.js";
 
 // web-tree-sitter types — imported dynamically to avoid top-level WASM init
@@ -31,7 +31,7 @@ type QueryType = import("web-tree-sitter").Query;
 // Language Detection
 // =============================================================================
 
-export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust";
+export type SupportedLanguage = "typescript" | "tsx" | "javascript" | "python" | "go" | "rust" | "bsl";
 
 const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".ts": "typescript",
@@ -45,6 +45,8 @@ const EXTENSION_MAP: Record<string, SupportedLanguage> = {
   ".py": "python",
   ".go": "go",
   ".rs": "rust",
+  ".bsl": "bsl",
+  ".osl": "bsl",
 };
 
 /**
@@ -60,17 +62,24 @@ export function detectLanguage(filepath: string): SupportedLanguage | null {
 // Grammar Resolution
 // =============================================================================
 
+type GrammarRef =
+  | { pkg: string; wasm: string }
+  | { bundled: true; wasm: string };
+
 /**
- * Maps language to the npm package and wasm filename for the grammar.
+ * Maps language to npm package wasm or a repo-bundled wasm file.
  */
-const GRAMMAR_MAP: Record<SupportedLanguage, { pkg: string; wasm: string }> = {
+const GRAMMAR_MAP: Record<SupportedLanguage, GrammarRef> = {
   typescript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm" },
   tsx:        { pkg: "tree-sitter-typescript", wasm: "tree-sitter-tsx.wasm" },
   javascript: { pkg: "tree-sitter-typescript", wasm: "tree-sitter-typescript.wasm" },
   python:     { pkg: "tree-sitter-python",     wasm: "tree-sitter-python.wasm" },
   go:         { pkg: "tree-sitter-go",         wasm: "tree-sitter-go.wasm" },
   rust:       { pkg: "tree-sitter-rust",        wasm: "tree-sitter-rust.wasm" },
+  bsl:        { bundled: true, wasm: "tree-sitter-bsl.wasm" },
 };
+
+const AST_MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 
 // =============================================================================
 // Per-Language Query Definitions
@@ -141,6 +150,11 @@ const LANGUAGE_QUERIES: Record<SupportedLanguage, string> = {
     (type_item) @type
     (mod_item) @mod
   `,
+  bsl: `
+    (procedure_definition) @func
+    (function_definition) @func
+    (var_definition) @type
+  `,
 };
 
 /**
@@ -203,9 +217,16 @@ async function ensureInit(): Promise<void> {
  * Uses createRequire to resolve from installed dependency packages.
  */
 function resolveGrammarPath(language: SupportedLanguage): string {
-  const { pkg, wasm } = GRAMMAR_MAP[language];
+  const ref = GRAMMAR_MAP[language];
+  if ("bundled" in ref) {
+    return join(AST_MODULE_DIR, "..", "assets", "grammars", ref.wasm);
+  }
   const require = createRequire(import.meta.url);
-  return require.resolve(`${pkg}/${wasm}`);
+  return require.resolve(`${ref.pkg}/${ref.wasm}`);
+}
+
+function grammarCacheKey(language: SupportedLanguage): string {
+  return GRAMMAR_MAP[language].wasm;
 }
 
 /**
@@ -215,7 +236,7 @@ function resolveGrammarPath(language: SupportedLanguage): string {
 async function loadGrammar(language: SupportedLanguage): Promise<LanguageType | null> {
   if (failedLanguages.has(language)) return null;
 
-  const wasmKey = GRAMMAR_MAP[language].wasm;
+  const wasmKey = grammarCacheKey(language);
   if (!grammarCache.has(wasmKey)) {
     grammarCache.set(wasmKey, (async () => {
       const path = resolveGrammarPath(language);

@@ -419,6 +419,13 @@ export interface LLM {
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
 
   /**
+   * Preferred chunk batch size for embedBatch calls.
+   * Local models default to 32 (CPU bound). Cloud APIs should return a larger value
+   * (e.g. 512–1024) to amortize per-request HTTP overhead.
+   */
+  readonly preferredEmbedBatchSize?: number;
+
+  /**
    * Dispose of resources
    */
   dispose(): Promise<void>;

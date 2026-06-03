@@ -122,23 +122,24 @@ function getStore(): ReturnType<typeof createStore> {
   if (!store) {
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    let config;
     try {
-      const config = loadConfig();
+      config = loadConfig();
       syncConfigToDb(store.db, config);
-      if (config.models) {
-        const embedUri = config.models.embed;
-        if (embedUri?.startsWith("openrouter:")) {
-          setDefaultLlamaCpp(new OpenRouterEmbedding(embedUri, { batchSize: config.models?.embedBatchSize }));
-        } else {
-          setDefaultLlamaCpp(new LlamaCpp({
-            embedModel: embedUri,
-            generateModel: config.models.generate,
-            rerankModel: config.models.rerank,
-          }));
-        }
-      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
+    }
+    if (config?.models) {
+      const embedUri = config.models.embed;
+      if (embedUri?.startsWith("openrouter:")) {
+        setDefaultLlamaCpp(new OpenRouterEmbedding(embedUri, { batchSize: config.models?.embedBatchSize }));
+      } else {
+        setDefaultLlamaCpp(new LlamaCpp({
+          embedModel: embedUri,
+          generateModel: config.models.generate,
+          rerankModel: config.models.rerank,
+        }));
+      }
     }
   }
   return store;
@@ -1749,12 +1750,12 @@ function resolveEmbedTimeoutEnvValue(cwd: string): { value: string | undefined; 
 }
 
 async function vectorIndex(
-  model: string = DEFAULT_EMBED_MODEL_URI,
   force: boolean = false,
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  const model = getDefaultLlamaCpp().embedModelName;
 
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
@@ -3350,7 +3351,7 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
-        await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force, {
+        await vectorIndex(!!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
