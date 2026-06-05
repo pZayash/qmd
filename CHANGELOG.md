@@ -2,7 +2,52 @@
 
 ## [Unreleased]
 
+### Fixes
+
+- OpenRouter embeddings: surface the real network failure cause instead of a bare
+  "fetch failed" (e.g. `UND_ERR_CONNECT_TIMEOUT`, `ENOTFOUND`), and retry transient
+  network errors (2x). HTTP error responses are not retried.
+- OpenRouter embeddings: guard against HTTP 200 responses with no `data` array
+  (returned for too-large input batches) — throw an actionable error instead of a
+  downstream "data is not iterable".
+- OpenRouter embeddings: lower default batch size 1024 → 64. Batches ≥128 are
+  rejected by `qwen/qwen3-embedding-8b`; override via `models.embedBatchSize`.
+
 ### Changes
+
+- Env loading: unify into a precedence cascade — shell env > `<cwd>/.env`
+  (project-local) > `~/.config/qmd/.env` (global). Previously only the global
+  file was read for general vars (a project `.env` was ignored), while
+  `QMD_EMBED_SESSION_MAX_DURATION_SEC` alone read the project `.env` — now all
+  `QMD_*` vars resolve through the same cascade. The shared parser also handles
+  an `export` prefix, inline `#` comments, and quoted values. Keep secrets in
+  the global file; use a project `.env` (gitignored) for per-collection
+  endpoint/debug overrides.
+
+- OpenRouter embeddings: add `QMD_EMBED_DEBUG=1` to log (stderr) the configured
+  endpoints, which URL/model each request targets, and failover hops — to
+  diagnose whether requests go to the cloud primary or a local endpoint.
+
+- OpenRouter embeddings: add an optional local fallback endpoint. When the cloud
+  provider is unreachable (network error or HTTP 5xx/429), embedding requests fail
+  over to a local OpenAI-compatible server (e.g. LMStudio). Configure via
+  `models.embedFallbackUrl` (+ optional `embedFallbackModel`, `embedFallbackApiKey`)
+  or env `QMD_EMBED_FALLBACK_URL` / `QMD_EMBED_FALLBACK_MODEL` /
+  `QMD_EMBED_FALLBACK_API_KEY`. The local server MUST serve the **same** embedding
+  model/dimensions as the cloud one — vectors share a single vec table and are not
+  filtered by model tag. 4xx responses are terminal (no failover). With a fallback
+  set, a missing `OPENROUTER_API_KEY` yields a local-only setup. The DB model tag
+  and query format stay the primary URI, so online/offline queries match indexed
+  vectors.
+
+- OpenRouter embeddings: add a hard endpoint override. When set, ALL embedding
+  requests go to a single OpenAI-compatible endpoint, bypassing the cloud primary
+  and the fallback chain (no failover) — for debugging, tests, and emergency
+  switches. Configure via `models.embedEndpointUrl` (+ optional `embedEndpointModel`,
+  `embedEndpointApiKey`) or env `QMD_EMBED_ENDPOINT` / `QMD_EMBED_ENDPOINT_MODEL` /
+  `QMD_EMBED_ENDPOINT_API_KEY` (env wins, needs no cloud key). The logical model
+  URI (DB tag + query format) is unchanged — the endpoint MUST serve the same
+  model/dimensions.
 
 - AST chunking: add BSL (1C) support for `.bsl` and `.osl` via vendored
   `tree-sitter-bsl` wasm ([alkoleft/tree-sitter-bsl](https://github.com/alkoleft/tree-sitter-bsl)

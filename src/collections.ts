@@ -41,6 +41,19 @@ export interface ModelsConfig {
   rerank?: string;
   generate?: string;
   embedBatchSize?: number;
+  // Local OpenAI-compatible fallback for a cloud `embed` provider (e.g. LMStudio).
+  // Used when the cloud endpoint is unreachable (network error / 5xx). The local
+  // server MUST serve the SAME embedding model/dimensions as the cloud one.
+  embedFallbackUrl?: string;     // base (.../v1) or full (.../v1/embeddings) URL
+  embedFallbackModel?: string;   // defaults to the cloud model id
+  embedFallbackApiKey?: string;  // optional; local servers ignore it
+  // Hard endpoint override: force ALL embedding requests to this single endpoint,
+  // bypassing the cloud primary and fallback chain (debug/tests/emergency switch).
+  // Env QMD_EMBED_ENDPOINT* takes precedence over these. Endpoint MUST serve the
+  // SAME model/dimensions — the logical model URI (DB tag) is unchanged.
+  embedEndpointUrl?: string;     // base (.../v1) or full (.../v1/embeddings) URL
+  embedEndpointModel?: string;   // defaults to the `embed` model id
+  embedEndpointApiKey?: string;  // optional
 }
 
 /**
@@ -147,8 +160,10 @@ function ensureConfigDir(): void {
  * Existing env vars take priority (are not overwritten).
  * Called once at CLI/SDK startup.
  */
-export function loadConfigEnv(): void {
-  const envPath = join(getConfigDir(), ".env");
+// Load one .env file into process.env. Existing keys are never overwritten, so
+// the first source to define a key wins. Returns silently if the file is absent
+// or unreadable.
+function loadEnvFile(envPath: string): void {
   if (!existsSync(envPath)) return;
 
   let content: string;
@@ -158,27 +173,43 @@ export function loadConfigEnv(): void {
     return;
   }
 
-  for (const rawLine of content.split("\n")) {
+  for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
 
-    const eqIdx = line.indexOf("=");
-    if (eqIdx < 1) continue;
+    // Accept an optional `export ` prefix; key must be a valid identifier.
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    const key = match[1]!;
+    let value = match[2] ?? "";
 
-    const key = line.slice(0, eqIdx).trim();
-    let value = line.slice(eqIdx + 1).trim();
-
-    // Strip surrounding quotes (single or double)
+    // Strip an unquoted trailing inline comment, then surrounding quotes.
+    value = value.replace(/\s+#.*$/, "").trim();
     if ((value.startsWith('"') && value.endsWith('"')) ||
         (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1);
     }
 
-    // Env vars already set in the environment take priority
-    if (key && !(key in process.env)) {
+    // Env vars already set in the environment take priority (first source wins).
+    if (!(key in process.env)) {
       process.env[key] = value;
     }
   }
+}
+
+/**
+ * Load env vars with a precedence cascade (highest wins):
+ *   1. shell env       — already in process.env, never overwritten
+ *   2. <cwd>/.env      — project-local overrides (per-collection endpoints, debug)
+ *   3. ~/.config/qmd/.env — global secrets/defaults (e.g. OPENROUTER_API_KEY)
+ * Because loadEnvFile never overwrites an existing key, loading the project file
+ * before the global file gives the project file priority over the global one.
+ * `cwd` defaults to the shell working dir (PWD, matching getPwd()); pass
+ * explicitly for tests/SDK embedding.
+ */
+export function loadConfigEnv(cwd: string = process.env.PWD || process.cwd()): void {
+  loadEnvFile(join(cwd, ".env"));         // project-local (higher priority)
+  loadEnvFile(join(getConfigDir(), ".env")); // global (lower priority)
 }
 
 /**

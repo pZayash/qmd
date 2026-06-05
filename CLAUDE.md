@@ -181,6 +181,27 @@ bun test --preload ./src/test-preload.ts test/
 - The `qmd` file is a shell script that runs compiled JS from `dist/` - do not replace it
 - `npm run build` compiles TypeScript to `dist/` via `tsc -p tsconfig.build.json`
 
+### Building on Windows / PowerShell
+
+`npm run build` has a postbuild step that prepends a shebang to `dist/cli/qmd.js`
+using Unix tools (`printf | cat - ... > tmp && mv && chmod`). On Windows/PowerShell
+the `tsc` part succeeds but the postbuild **fails** with `'printf' is not recognized`.
+The compile still happened — only the shebang is missing. Two options:
+
+- Run the whole build through the Bash tool (POSIX), not PowerShell, OR
+- After `npm run build` reports the printf error, finish the postbuild manually in bash.
+
+```sh
+printf '#!/usr/bin/env node\n' | cat - dist/cli/qmd.js > dist/cli/qmd.tmp \
+  && mv dist/cli/qmd.tmp dist/cli/qmd.js && chmod +x dist/cli/qmd.js
+```
+
+Verify success: `head -1 dist/cli/qmd.js` shows `#!/usr/bin/env node`.
+
+After editing TS, the `qmd` CLI runs `dist/` — changes need a rebuild. A running
+MCP daemon also pins old code + env vars; restart it (`qmd mcp stop` then start)
+to pick up new code or new `QMD_EMBED_*` env vars.
+
 ## Releasing
 
 Use `/release <version>` to cut a release. Full changelog standards,

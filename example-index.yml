@@ -31,3 +31,38 @@ collections:
     pattern: "**/*.md"
     context:
       "/": "Thematic collections of important concepts and discussions"
+
+# Model configuration (optional). Defaults use local node-llama-cpp models.
+# models:
+#   # Cloud embeddings via OpenRouter (needs OPENROUTER_API_KEY env var).
+#   embed: "openrouter:qwen/qwen3-embedding-8b"
+#   embedBatchSize: 64
+#
+#   # Local fallback when the cloud endpoint is unreachable (network error / 5xx).
+#   # Point at an OpenAI-compatible server (e.g. LMStudio) running the SAME model
+#   # at the SAME dimensions — vectors share one table and aren't filtered by tag.
+#   # A 4xx from the cloud is terminal (no failover). With a fallback set, a missing
+#   # OPENROUTER_API_KEY makes this a local-only setup.
+#   embedFallbackUrl: "http://localhost:1234/v1"   # base or full /embeddings URL
+#   embedFallbackModel: "qwen/qwen3-embedding-8b"  # optional; defaults to `embed` model id
+#   # embedFallbackApiKey: "lm-studio"             # optional; local servers ignore it
+#
+#   # Hard endpoint override (debug/tests/emergency). Forces ALL embedding requests
+#   # to this single endpoint, bypassing the cloud primary AND fallback (no failover).
+#   # Endpoint MUST serve the SAME model/dimensions. Env QMD_EMBED_ENDPOINT* wins.
+#   # embedEndpointUrl: "http://localhost:1234/v1"
+#   # embedEndpointModel: "qwen/qwen3-embedding-8b"
+#   # embedEndpointApiKey: "lm-studio"
+#
+# Equivalent env vars (cover all entry points incl. the store fallback path):
+#   QMD_EMBED_FALLBACK_URL, QMD_EMBED_FALLBACK_MODEL, QMD_EMBED_FALLBACK_API_KEY
+#   QMD_EMBED_ENDPOINT, QMD_EMBED_ENDPOINT_MODEL, QMD_EMBED_ENDPOINT_API_KEY  # hard override
+#   QMD_EMBED_DEBUG=1   # log which endpoint each embedding request hits (stderr)
+#
+# Env files load as a cascade (highest priority wins):
+#   1. shell env                — exported in the shell, never overwritten
+#   2. <cwd>/.env               — project-local; per-collection overrides
+#   3. ~/.config/qmd/.env       — global secrets/defaults (e.g. OPENROUTER_API_KEY)
+# Keep secrets in the global file; use the project .env for per-collection
+# endpoint/debug overrides. A project .env may hold secrets too — add it to
+# .gitignore so it is never committed.

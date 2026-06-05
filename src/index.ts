@@ -379,7 +379,23 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   // otherwise use local LlamaCpp (lazy-loads models, auto-unloads after 5 min inactivity).
   const embedUri = config?.models?.embed;
   const llm: LLM = embedUri?.startsWith("openrouter:")
-    ? new OpenRouterEmbedding(embedUri, { batchSize: config?.models?.embedBatchSize })
+    ? new OpenRouterEmbedding(embedUri, {
+        batchSize: config?.models?.embedBatchSize,
+        fallback: config?.models?.embedFallbackUrl
+          ? {
+              url: config.models.embedFallbackUrl,
+              model: config.models.embedFallbackModel,
+              apiKey: config.models.embedFallbackApiKey,
+            }
+          : undefined,
+        override: config?.models?.embedEndpointUrl
+          ? {
+              url: config.models.embedEndpointUrl,
+              model: config.models.embedEndpointModel,
+              apiKey: config.models.embedEndpointApiKey,
+            }
+          : undefined,
+      })
     : new LlamaCpp({
         embedModel: embedUri,
         generateModel: config?.models?.generate,

@@ -132,7 +132,23 @@ function getStore(): ReturnType<typeof createStore> {
     if (config?.models) {
       const embedUri = config.models.embed;
       if (embedUri?.startsWith("openrouter:")) {
-        setDefaultLlamaCpp(new OpenRouterEmbedding(embedUri, { batchSize: config.models?.embedBatchSize }));
+        setDefaultLlamaCpp(new OpenRouterEmbedding(embedUri, {
+          batchSize: config.models?.embedBatchSize,
+          fallback: config.models?.embedFallbackUrl
+            ? {
+                url: config.models.embedFallbackUrl,
+                model: config.models.embedFallbackModel,
+                apiKey: config.models.embedFallbackApiKey,
+              }
+            : undefined,
+          override: config.models?.embedEndpointUrl
+            ? {
+                url: config.models.embedEndpointUrl,
+                model: config.models.embedEndpointModel,
+                apiKey: config.models.embedEndpointApiKey,
+              }
+            : undefined,
+        }));
       } else {
         setDefaultLlamaCpp(new LlamaCpp({
           embedModel: embedUri,
@@ -1728,24 +1744,15 @@ export function parseDotEnvValue(content: string, key: string): string | undefin
   return undefined;
 }
 
-function resolveEmbedTimeoutEnvValue(cwd: string): { value: string | undefined; source: "env" | ".env" | "default" } {
+// QMD_EMBED_SESSION_MAX_DURATION_SEC is resolved from process.env, which
+// loadConfigEnv() has already populated via the cascade (shell > <cwd>/.env >
+// ~/.config/qmd/.env). No separate file read here — the cascade is the single
+// source of truth for all QMD_* vars.
+function resolveEmbedTimeoutEnvValue(): { value: string | undefined; source: "env" | "default" } {
   const envValue = process.env.QMD_EMBED_SESSION_MAX_DURATION_SEC?.trim();
   if (envValue) {
     return { value: envValue, source: "env" };
   }
-
-  const envFilePath = pathJoin(cwd, ".env");
-  if (existsSync(envFilePath)) {
-    try {
-      const fileValue = parseDotEnvValue(readFileSync(envFilePath, "utf-8"), "QMD_EMBED_SESSION_MAX_DURATION_SEC")?.trim();
-      if (fileValue) {
-        return { value: fileValue, source: ".env" };
-      }
-    } catch {
-      // Ignore unreadable .env and fall back to defaults.
-    }
-  }
-
   return { value: undefined, source: "default" };
 }
 
@@ -1776,20 +1783,18 @@ async function vectorIndex(
     console.log(`${c.dim}Batch: ${maxDocsPerBatch} docs / ${formatBytes(maxBatchBytes)}${c.reset}\n`);
   }
 
-  const embedTimeoutConfig = resolveEmbedTimeoutEnvValue(getPwd());
+  const embedTimeoutConfig = resolveEmbedTimeoutEnvValue();
   const embedSessionMaxDurationMs = resolveEmbedSessionMaxDurationMs(embedTimeoutConfig.value);
   if (embedSessionMaxDurationMs === 0) {
-    const suffix = embedTimeoutConfig.source === ".env" ? " (.env)" : "";
+    const suffix = embedTimeoutConfig.source === "env" ? " (env)" : "";
     console.log(`${c.dim}Embed session timeout: disabled (QMD_EMBED_SESSION_MAX_DURATION_SEC=0${suffix})${c.reset}\n`);
   } else {
     const sec = Math.round(embedSessionMaxDurationMs / 1000);
     const suffix = embedTimeoutConfig.source === "env"
       ? " (env)"
-      : embedTimeoutConfig.source === ".env"
-        ? " (.env)"
-        : embedSessionMaxDurationMs === DEFAULT_EMBED_SESSION_MAX_DURATION_MS
-          ? " (default)"
-          : "";
+      : embedSessionMaxDurationMs === DEFAULT_EMBED_SESSION_MAX_DURATION_MS
+        ? " (default)"
+        : "";
     console.log(`${c.dim}Embed session timeout: ${sec}s${suffix}${c.reset}\n`);
   }
 

@@ -74,7 +74,7 @@ function printTable(rows: ResultRow[]) {
   for (const r of rows) {
     const bsStr = typeof r.batchSize === "number" ? String(r.batchSize) : r.batchSize;
     console.log(
-      `│ ${r.label.padEnd(36)} │ ${bsStr.padStart(9)} │ ${String(r.chunks).padStart(6)} │ ${formatMs(r.totalMs).padStart(8)} │ ${r.msPerChunk.toFixed(1).padStart(10)} │ ${r.kbps.toFixed(1).padStart(10)} │`
+      `│ ${r.label.padEnd(36)} │ ${bsStr.padStart(9)} │ ${String(r.chunks).padStart(6)} │ ${formatMs(r.totalMs).padStart(8)} │ ${r.msPerChunk.toFixed(1).padStart(10)} │ ${r.kbps.toFixed(0).padStart(10)} │`
     );
   }
   console.log("└──────────────────────────────────────┴───────────┴────────┴──────────┴────────────┴────────────┘");
@@ -95,7 +95,7 @@ describe("Embedding speed benchmark", () => {
     }
     const totalKb = docs.reduce((s, d) => s + d.bytes, 0) / 1024;
     console.log(`\nLoaded ${docs.length} documents (${MIN_BYTES}–${MAX_BYTES} bytes, ${totalKb.toFixed(0)} KB total, avg ${(totalKb * 1024 / docs.length).toFixed(0)} bytes)`);
-  });
+  }, 60_000); // sync SQLite ORDER BY RANDOM() + native sqlite-vec load can exceed vitest's 10s default
 
   afterAll(async () => {
     printTable(results);
@@ -145,7 +145,7 @@ describe("Embedding speed benchmark", () => {
       const elapsed = performance.now() - t0;
 
       const ok = embeddings.filter(Boolean).length;
-      console.log(`[OpenRouter batch=${batchSize}] done: ${ok}/${slice.length} in ${formatMs(elapsed)}, ms/chunk=${(elapsed / ok).toFixed(1)}`);
+      console.log(`[OpenRouter batch=${batchSize}] done: ${ok}/${slice.length} in ${formatMs(elapsed)}, ${(kb / (elapsed / 1000)).toFixed(0)} KB/s`);
 
       results.push({
         label: `OpenRouter ${OPENROUTER_MODEL}`,
@@ -172,7 +172,7 @@ describe("Embedding speed benchmark", () => {
     const elapsed = performance.now() - t0;
 
     const ok = embeddings.filter(Boolean).length;
-    console.log(`[OpenRouter batch=1024] done: ${ok}/${docs.length} in ${formatMs(elapsed)}, ms/chunk=${(elapsed / ok).toFixed(1)}`);
+    console.log(`[OpenRouter batch=1024] done: ${ok}/${docs.length} in ${formatMs(elapsed)}, ${(kb / (elapsed / 1000)).toFixed(0)} KB/s`);
 
     results.push({
       label: `OpenRouter ${OPENROUTER_MODEL}`,
