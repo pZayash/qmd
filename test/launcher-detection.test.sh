@@ -20,7 +20,7 @@ fail() { printf "  %-60s FAIL\n" "$1 (got: $2, expected: $3)"; FAIL=$((FAIL + 1)
 # Instead of exec-ing a runtime, we echo which one would be chosen.
 detect_runtime() {
   local DIR="$1"
-  if [ -f "$DIR/package-lock.json" ]; then
+  if [ -f "$DIR/package-lock.json" ] || [ -f "$DIR/pnpm-lock.yaml" ] || [ -f "$DIR/yarn.lock" ]; then
     echo "node"
   elif [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
     echo "bun"
@@ -91,6 +91,25 @@ touch "$d/package-lock.json"
 touch "$d/bun.lock"
 touch "$d/bun.lockb"
 assert_runtime "all three lockfiles → node (npm priority)" "$d" "node"
+
+# 8. Only pnpm-lock.yaml → node
+d="$TMPDIR_BASE/pnpm-only"
+mkdir -p "$d"
+touch "$d/pnpm-lock.yaml"
+assert_runtime "pnpm-lock.yaml only → node" "$d" "node"
+
+# 9. pnpm-lock.yaml + bun.lock → node (pnpm takes priority)
+d="$TMPDIR_BASE/pnpm-and-bun"
+mkdir -p "$d"
+touch "$d/pnpm-lock.yaml"
+touch "$d/bun.lock"
+assert_runtime "pnpm-lock.yaml + bun.lock → node (pnpm priority)" "$d" "node"
+
+# 10. Only yarn.lock → node
+d="$TMPDIR_BASE/yarn-only"
+mkdir -p "$d"
+touch "$d/yarn.lock"
+assert_runtime "yarn.lock only → node" "$d" "node"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

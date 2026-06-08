@@ -19,14 +19,18 @@ DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 # $BUN_INSTALL is intentionally NOT checked — it only indicates that bun exists
 # on the system, not that it was used to install this package (see #361).
 #
-# package-lock.json takes priority: if it exists, npm installed the native
-# modules for Node.  The repo ships bun.lock, so without this check, source
-# builds that use npm would be incorrectly routed to bun, causing ABI
-# mismatches with better-sqlite3 / sqlite-vec (see #381).
-if [ -f "$DIR/package-lock.json" ]; then
+# Node lockfiles take priority: npm/pnpm/yarn install native modules for Node.
+# The repo ships bun.lock, so without this check, source builds that use npm or
+# pnpm would be incorrectly routed to bun, causing ABI mismatches with
+# better-sqlite3 / sqlite-vec (see #381).
+if [ -f "$DIR/package-lock.json" ] || [ -f "$DIR/pnpm-lock.yaml" ] || [ -f "$DIR/yarn.lock" ]; then
   exec node "$DIR/dist/cli/qmd.js" "$@"
 elif [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
-  exec bun "$DIR/dist/cli/qmd.js" "$@"
+  if command -v bun >/dev/null 2>&1; then
+    exec bun "$DIR/dist/cli/qmd.js" "$@"
+  else
+    exec node "$DIR/dist/cli/qmd.js" "$@"
+  fi
 else
   exec node "$DIR/dist/cli/qmd.js" "$@"
 fi

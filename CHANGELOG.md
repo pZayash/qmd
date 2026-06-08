@@ -4,6 +4,10 @@
 
 ### Fixes
 
+- Launcher: treat `pnpm-lock.yaml` and `yarn.lock` like `package-lock.json` (route
+  to Node). Repo ships `bun.lock` but installs via pnpm — without this, `qmd`
+  exec'd `bun` when it was not on PATH. Bun-only checkouts fall back to Node when
+  `bun` is missing.
 - OpenRouter embeddings: surface the real network failure cause instead of a bare
   "fetch failed" (e.g. `UND_ERR_CONNECT_TIMEOUT`, `ENOTFOUND`), and retry transient
   network errors (2x). HTTP error responses are not retried.
