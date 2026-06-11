@@ -28,6 +28,7 @@ import {
   getHashesNeedingEmbedding,
   clearAllEmbeddings,
   insertEmbedding,
+  getVecQuantConfig,
   getStatus,
   hashContent,
   extractTitle,
@@ -404,6 +405,23 @@ async function showStatus(): Promise<void> {
   if (mostRecent.latest) {
     const lastUpdate = new Date(mostRecent.latest);
     console.log(`  Updated:  ${formatTimeAgo(lastUpdate)}`);
+  }
+
+  // Vector search mode (quantized two-pass vs exact float scan)
+  const vq = getVecQuantConfig();
+  console.log(`\n${c.bold}Vector Search${c.reset}`);
+  if (vq.enabled) {
+    const bitInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_bit'`).get() as { sql: string } | undefined;
+    const bitDim = bitInfo?.sql.match(/bit\[(\d+)\]/)?.[1];
+    const bitCount = bitInfo ? (db.prepare(`SELECT COUNT(*) AS c FROM vectors_bit`).get() as { c: number }).c : 0;
+    console.log(`  Mode:     ${c.green}quantized${c.reset} (bit[${bitDim ?? "?"}] coarse + int8 rescore, oversample ${vq.oversample})`);
+    if (bitCount === 0 && vectorCount.count > 0) {
+      console.log(`  ${c.yellow}Quant tables empty${c.reset} — run 'qmd embed --requantize' (falls back to exact scan until then)`);
+    } else {
+      console.log(`  Quantized: ${bitCount} vectors`);
+    }
+  } else {
+    console.log(`  Mode:     exact float scan (QMD_VEC_QUANT=0)`);
   }
 
   // Get all contexts grouped by collection (from YAML)
@@ -1848,6 +1866,35 @@ async function vectorIndex(
   closeDb();
 }
 
+// Rebuild the quantized vector tables (bit coarse + int8 rescore) from the
+// existing float vectors. Purely local — no embedding/cloud calls.
+async function requantizeVectors(): Promise<void> {
+  const storeInstance = getStore();
+  console.log(`${c.bold}Requantizing vectors${c.reset} ${c.dim}(bit coarse + int8 rescore, from existing float vectors)${c.reset}\n`);
+
+  const startTime = Date.now();
+  cursor.hide();
+  progress.indeterminate();
+
+  const result = storeInstance.requantizeFromFloat((done, total) => {
+    if (total === 0) return;
+    const percent = (done / total) * 100;
+    progress.set(percent);
+    if (isTTY) {
+      const bar = renderProgressBar(percent);
+      process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percent.toFixed(0).padStart(3)}%${c.reset} ${c.dim}${done}/${total}${c.reset}   `);
+    }
+  });
+
+  progress.clear();
+  cursor.show();
+
+  const sec = (Date.now() - startTime) / 1000;
+  console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
+  console.log(`\n${c.green}✓ Done!${c.reset} Requantized ${c.bold}${result.count}${c.reset} vectors in ${c.bold}${formatETA(sec)}${c.reset}`);
+  closeDb();
+}
+
 // Sanitize a term for FTS5: remove punctuation except apostrophes
 function sanitizeFTS5Term(term: string): string {
   // Remove all non-alphanumeric except apostrophes (for contractions like "don't")
@@ -2646,6 +2693,8 @@ function parseCLI() {
       intent: { type: "string" },
       // Chunking options
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
+      // Rebuild quantized vector tables from existing float vectors (no re-embed)
+      requantize: { type: "boolean", default: false },
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -3353,6 +3402,10 @@ if (isMain) {
 
     case "embed":
       try {
+        if (cli.values.requantize) {
+          await requantizeVectors();
+          break;
+        }
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);

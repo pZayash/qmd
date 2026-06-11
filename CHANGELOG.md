@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Features
+
+- Quantized vector search (default): replaces the brute-force `float[N]` scan with
+  a two-pass pipeline — a binary `bit[cutDim]` coarse hamming knn (Matryoshka-
+  truncated) followed by an exact `int8[fullDim]` cosine rescore over the
+  candidates. On a 223k×4096d corpus this cuts a single vector lookup from
+  ~2950 ms to tens of ms (~30–50x) at ~96% recall@10; the recall feeds RRF + LLM
+  rerank so end-to-end quality is unaffected. The original `float` vectors are
+  kept untouched as the exact fallback. Tune with env vars:
+  - `QMD_VEC_QUANT` (default on; `0` forces the exact float scan)
+  - `QMD_VEC_CUT_DIM` (default `1024`; coarse Matryoshka dim, floored to a
+    multiple of 8)
+  - `QMD_VEC_OVERSAMPLE` (default `8`; coarse candidate pool = `vecK * oversample`)
+- `qmd embed --requantize`: rebuild the quantized tables (`vectors_bit` +
+  `vectors_rescore`) from the existing float vectors — purely local, no
+  re-embedding/cloud calls. Run after upgrading an already-embedded index or
+  after changing `QMD_VEC_CUT_DIM`. `qmd status` shows the vector-search mode and
+  warns when the quant tables are empty (search falls back to the exact scan
+  until then).
+
 ### Fixes
 
 - Launcher: treat `pnpm-lock.yaml` and `yarn.lock` like `package-lock.json` (route

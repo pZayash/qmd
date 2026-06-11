@@ -28,6 +28,7 @@ qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated
 qmd status                        # Show index status and collections
 qmd update [--pull]               # Re-index all collections (--pull: git pull first)
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
+qmd embed --requantize            # Rebuild quantized vector tables from existing floats (local, no re-embed)
 qmd query <query>                 # Search with query expansion + reranking (recommended)
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)
@@ -162,7 +163,11 @@ bun test --preload ./src/test-preload.ts test/
 ## Architecture
 
 - SQLite FTS5 for full-text search (BM25)
-- sqlite-vec for vector similarity search
+- sqlite-vec for vector similarity search. Quantized two-pass by default: binary
+  `bit[cutDim]` coarse hamming knn (`vectors_bit`) + exact `int8[fullDim]` cosine
+  rescore (`vectors_rescore`); the original `float` vectors (`vectors_vec`) are
+  kept as the exact fallback. Tune via `QMD_VEC_QUANT` / `QMD_VEC_CUT_DIM` /
+  `QMD_VEC_OVERSAMPLE`; rebuild from existing floats with `qmd embed --requantize`.
 - node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
 - Reciprocal Rank Fusion (RRF) for combining results
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries

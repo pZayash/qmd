@@ -893,6 +893,17 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  // Rescore store for quantized vector search — holds the full-dimension int8
+  // vectors keyed by hash_seq. Plain B-tree (WITHOUT ROWID) so candidate fetch
+  // by primary key is fast (vec0 random PK access is ~30x slower). See
+  // getVecQuantConfig / quantVecSearch.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS vectors_rescore (
+      hash_seq TEXT PRIMARY KEY,
+      emb BLOB NOT NULL
+    ) WITHOUT ROWID
+  `);
+
   // Store collections — makes the DB self-contained (no external config needed)
   db.exec(`
     CREATE TABLE IF NOT EXISTS store_collections (
@@ -1140,6 +1151,118 @@ export function isSqliteVecAvailable(): boolean {
   return _sqliteVecAvailable === true;
 }
 
+// =============================================================================
+// Vector quantization — config & helpers
+// =============================================================================
+//
+// Quantized vector search (default) is a two-pass pipeline that replaces the
+// brute-force float[N] scan (~3s on a 223k×4096d corpus):
+//   1. coarse: bit[cutDim] hamming knn in vec0 (vectors_bit) — Matryoshka-truncated
+//   2. rescore: int8[fullDim] cosine over the candidate pool (vectors_rescore,
+//      a plain indexed table for fast PK fetch)
+// The original float vectors_vec is kept untouched as the exact fallback
+// (QMD_VEC_QUANT=0) and as the local source for `qmd embed --requantize`.
+
+const DEFAULT_VEC_CUT_DIM = 1024;
+// Coarse candidate pool = clamp(vecK * oversample, MIN..MAX). vecK is already
+// 3x (or 30x for path filters) the result limit, so a modest factor lands the
+// pool around a few hundred — the recall/latency knee from benchmarks.
+const DEFAULT_VEC_OVERSAMPLE = 8;
+const MIN_RESCORE_POOL = 200;
+const MAX_RESCORE_POOL = 2000;
+
+export type VecQuantConfig = {
+  enabled: boolean;
+  cutDim: number;
+  oversample: number;
+};
+
+function envBool(value: string | undefined, dflt: boolean): boolean {
+  if (value === undefined) return dflt;
+  const s = value.trim().toLowerCase();
+  if (s === "0" || s === "false" || s === "off" || s === "no") return false;
+  if (s === "1" || s === "true" || s === "on" || s === "yes") return true;
+  return dflt;
+}
+
+function envPosInt(value: string | undefined, dflt: number): number {
+  const n = parseInt((value ?? "").trim(), 10);
+  return Number.isFinite(n) && n > 0 ? n : dflt;
+}
+
+/** Resolve quantized-vector-search config from env (QMD_VEC_*). */
+export function getVecQuantConfig(): VecQuantConfig {
+  return {
+    enabled: envBool(process.env.QMD_VEC_QUANT, true),
+    cutDim: envPosInt(process.env.QMD_VEC_CUT_DIM, DEFAULT_VEC_CUT_DIM),
+    oversample: envPosInt(process.env.QMD_VEC_OVERSAMPLE, DEFAULT_VEC_OVERSAMPLE),
+  };
+}
+
+/**
+ * Effective coarse dim: min(cut, full) floored to a multiple of 8 (bit[]
+ * requires a length divisible by 8). Returns 0 when no valid dim exists
+ * (full dim < 8) — callers treat 0 as "embedding too small to quantize".
+ */
+export function effectiveCutDim(fullDim: number, cutDim: number): number {
+  let d = Math.min(cutDim, fullDim);
+  d -= d % 8;
+  return d >= 8 ? d : 0;
+}
+
+/** Read the cut dim baked into the vectors_bit DDL, or null if the table is absent. */
+function getBitCutDim(db: Database): number | null {
+  const info = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_bit'`).get() as { sql: string } | null;
+  if (!info) return null;
+  const m = info.sql.match(/bit\[(\d+)\]/);
+  return m?.[1] ? parseInt(m[1], 10) : null;
+}
+
+/** Truncate to cutDim (Matryoshka) and L2-renormalize. Valid for MRL models. */
+export function truncRenorm(full: Float32Array, cutDim: number): Float32Array {
+  const n = Math.min(cutDim, full.length);
+  let s = 0;
+  for (let i = 0; i < n; i++) s += full[i]! * full[i]!;
+  s = Math.sqrt(s) || 1;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = full[i]! / s;
+  return out;
+}
+
+/** Scalar-quantize a (unit-ish) float vector to int8 via round(v*127), clamped. */
+export function quantizeInt8(full: Float32Array): Buffer {
+  const out = new Int8Array(full.length);
+  for (let i = 0; i < full.length; i++) {
+    const v = Math.round(full[i]! * 127);
+    out[i] = v > 127 ? 127 : v < -128 ? -128 : v;
+  }
+  return Buffer.from(out.buffer, out.byteOffset, out.byteLength);
+}
+
+function f32ToBuffer(v: Float32Array): Buffer {
+  return Buffer.from(v.buffer, v.byteOffset, v.byteLength);
+}
+
+/**
+ * Create the quantized-search tables (bit coarse + int8 rescore) sized for the
+ * given full embedding dimension. No-op when quant is disabled or vec0 is
+ * unavailable. Rebuilds vectors_bit if the cut dim changed (requires a
+ * subsequent `qmd embed --requantize` to repopulate; search falls back to exact
+ * until then).
+ */
+function ensureQuantTablesInternal(db: Database, fullDim: number): void {
+  const cfg = getVecQuantConfig();
+  if (!cfg.enabled || !_sqliteVecAvailable) return;
+  const eff = effectiveCutDim(fullDim, cfg.cutDim);
+  if (eff === 0) return; // embedding too small to quantize — exact scan only
+  const existing = getBitCutDim(db);
+  if (existing !== null && existing !== eff) {
+    db.exec("DROP TABLE IF EXISTS vectors_bit");
+  }
+  db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_bit USING vec0(hash_seq TEXT PRIMARY KEY, embedding bit[${eff}])`);
+  db.exec(`CREATE TABLE IF NOT EXISTS vectors_rescore (hash_seq TEXT PRIMARY KEY, emb BLOB NOT NULL) WITHOUT ROWID`);
+}
+
 function ensureVecTableInternal(db: Database, dimensions: number): void {
   if (!_sqliteVecAvailable) {
     throw createSqliteVecUnavailableError(
@@ -1152,7 +1275,10 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
     const hasHashSeq = tableInfo.sql.includes('hash_seq');
     const hasCosine = tableInfo.sql.includes('distance_metric=cosine');
     const existingDims = match?.[1] ? parseInt(match[1], 10) : null;
-    if (existingDims === dimensions && hasHashSeq && hasCosine) return;
+    if (existingDims === dimensions && hasHashSeq && hasCosine) {
+      ensureQuantTablesInternal(db, dimensions);
+      return;
+    }
     if (existingDims !== null && existingDims !== dimensions) {
       throw new Error(
         `Embedding dimension mismatch: existing vectors are ${existingDims}d but the current model produces ${dimensions}d. ` +
@@ -1162,6 +1288,7 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
     db.exec("DROP TABLE IF EXISTS vectors_vec");
   }
   db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
+  ensureQuantTablesInternal(db, dimensions);
 }
 
 // =============================================================================
@@ -1240,6 +1367,7 @@ export type Store = {
   getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
+  requantizeFromFloat: (onProgress?: (done: number, total: number) => void) => { count: number; total: number };
 };
 
 // =============================================================================
@@ -1782,6 +1910,7 @@ export function createStore(dbPath?: string): Store {
     getHashesForEmbedding: () => getHashesForEmbedding(db),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
+    requantizeFromFloat: (onProgress?: (done: number, total: number) => void) => requantizeFromFloat(db, resolvedPath, onProgress),
   };
 
   return store;
@@ -2106,15 +2235,21 @@ export function cleanupOrphanedVectors(db: Database): number {
     return 0;
   }
 
-  // Delete from vectors_vec first
-  db.exec(`
-    DELETE FROM vectors_vec WHERE hash_seq IN (
-      SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
-      WHERE NOT EXISTS (
-        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
-      )
+  // Orphaned hash_seq keys, shared by every vector table.
+  const orphanKeysSql = `
+    SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+    WHERE NOT EXISTS (
+      SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
     )
-  `);
+  `;
+
+  // Delete from vectors_vec first
+  db.exec(`DELETE FROM vectors_vec WHERE hash_seq IN (${orphanKeysSql})`);
+
+  // Mirror the cleanup in the quantized tables (best-effort: they may not exist
+  // or vec0 may be unavailable for vectors_bit).
+  try { db.exec(`DELETE FROM vectors_bit WHERE hash_seq IN (${orphanKeysSql})`); } catch { /* no bit table */ }
+  try { db.exec(`DELETE FROM vectors_rescore WHERE hash_seq IN (${orphanKeysSql})`); } catch { /* no rescore table */ }
 
   // Delete from content_vectors
   db.exec(`
@@ -3273,6 +3408,71 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
+/**
+ * True when quantized search can run: vec0 available, the bit table exists with
+ * rows, and the rescore table has rows. A freshly created-but-empty bit table
+ * (e.g. before `qmd embed --requantize`) returns false so search falls back to
+ * the exact float scan.
+ */
+function quantSearchReady(db: Database): boolean {
+  if (!_sqliteVecAvailable) return false;
+  if (getBitCutDim(db) === null) return false;
+  try {
+    const bit = db.prepare(`SELECT 1 FROM vectors_bit LIMIT 1`).get();
+    if (!bit) return false;
+    const rsc = db.prepare(`SELECT 1 FROM vectors_rescore LIMIT 1`).get();
+    return !!rsc;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Two-pass quantized vector search:
+ *   1. coarse: bit[cutDim] hamming knn over a candidate pool (vectors_bit)
+ *   2. rescore: int8[fullDim] cosine over that pool (vectors_rescore)
+ * Returns {hash_seq, distance} compatible with the exact-scan path so the
+ * downstream doc-join/dedup is shared.
+ */
+function quantVecSearch(
+  db: Database,
+  full: Float32Array,
+  vecK: number,
+  cfg: VecQuantConfig,
+): { hash_seq: string; distance: number }[] {
+  const cutDim = getBitCutDim(db) ?? effectiveCutDim(full.length, cfg.cutDim);
+  const cutBuf = f32ToBuffer(truncRenorm(full, cutDim));
+
+  const pool = Math.min(Math.max(vecK * cfg.oversample, MIN_RESCORE_POOL), MAX_RESCORE_POOL);
+  const coarse = db.prepare(`
+    SELECT hash_seq FROM vectors_bit WHERE embedding MATCH vec_quantize_binary(?) AND k = ?
+  `).all(cutBuf, pool) as { hash_seq: string }[];
+  if (coarse.length === 0) return [];
+
+  // Fetch candidate int8 vectors by primary key (fast on the plain table).
+  const placeholders = coarse.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT hash_seq, emb FROM vectors_rescore WHERE hash_seq IN (${placeholders})
+  `).all(...coarse.map(c => c.hash_seq)) as { hash_seq: string; emb: Buffer }[];
+
+  // Rescore with exact int8 cosine; distance = 1 - cosine (matches score = 1 - distance).
+  const qi8 = new Int8Array(quantizeInt8(full).buffer);
+  let qNorm = 0;
+  for (let i = 0; i < qi8.length; i++) qNorm += qi8[i]! * qi8[i]!;
+  qNorm = Math.sqrt(qNorm) || 1;
+
+  const scored = rows.map(r => {
+    const v = new Int8Array(r.emb.buffer, r.emb.byteOffset, r.emb.length);
+    const n = Math.min(qi8.length, v.length);
+    let dot = 0, vNorm = 0;
+    for (let i = 0; i < n; i++) { dot += qi8[i]! * v[i]!; vNorm += v[i]! * v[i]!; }
+    const cos = dot / (qNorm * (Math.sqrt(vNorm) || 1));
+    return { hash_seq: r.hash_seq, distance: 1 - cos };
+  });
+  scored.sort((a, b) => a.distance - b.distance);
+  return scored.slice(0, vecK);
+}
+
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefixes?: string[]): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
@@ -3288,11 +3488,18 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
   // Inflate k when path-filtering: most ANN candidates may not match the narrow prefix
   const vecK = pathPrefixes?.length ? limit * 30 : limit * 3;
-  const vecResults = db.prepare(`
-    SELECT hash_seq, distance
-    FROM vectors_vec
-    WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), vecK) as { hash_seq: string; distance: number }[];
+  const fullEmbedding = embedding instanceof Float32Array ? embedding : new Float32Array(embedding);
+
+  // Quantized two-pass search (default) when the quant tables are populated;
+  // otherwise fall back to the exact float[N] scan.
+  const cfg = getVecQuantConfig();
+  const vecResults = (cfg.enabled && quantSearchReady(db))
+    ? quantVecSearch(db, fullEmbedding, vecK, cfg)
+    : db.prepare(`
+        SELECT hash_seq, distance
+        FROM vectors_vec
+        WHERE embedding MATCH ? AND k = ?
+      `).all(fullEmbedding, vecK) as { hash_seq: string; distance: number }[];
 
   if (vecResults.length === 0) return [];
 
@@ -3398,11 +3605,13 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
 
 /**
  * Clear all embeddings from the database (force re-index).
- * Deletes all rows from content_vectors and drops the vectors_vec table.
+ * Deletes content_vectors and drops the float, bit, and rescore vector tables.
  */
 export function clearAllEmbeddings(db: Database): void {
   db.exec(`DELETE FROM content_vectors`);
   db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+  db.exec(`DROP TABLE IF EXISTS vectors_bit`);
+  db.exec(`DROP TABLE IF EXISTS vectors_rescore`);
 }
 
 /**
@@ -3435,6 +3644,105 @@ export function insertEmbedding(
   const insertVecStmt = db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
   deleteVecStmt.run(hashSeq);
   insertVecStmt.run(hashSeq, embedding);
+
+  // Quantized search tables (default). Keep them in sync with the float vector
+  // so live re-embeds don't require a separate requantize pass.
+  insertQuantEmbedding(db, hashSeq, embedding);
+}
+
+/**
+ * Populate the quantized tables (bit coarse + int8 rescore) for one vector.
+ * No-op when quant is disabled or vec0 is unavailable. Ensures the tables exist
+ * first so direct callers (e.g. tests) don't need a prior ensureVecTable.
+ */
+export function insertQuantEmbedding(db: Database, hashSeq: string, embedding: Float32Array): void {
+  const cfg = getVecQuantConfig();
+  if (!cfg.enabled || !_sqliteVecAvailable) return;
+
+  ensureQuantTablesInternal(db, embedding.length);
+  const cutDim = getBitCutDim(db);
+  if (cutDim === null) return; // quant disabled or embedding too small to quantize
+  const cutBuf = f32ToBuffer(truncRenorm(embedding, cutDim));
+
+  // vec0 ignores OR REPLACE — DELETE + INSERT (same pattern as vectors_vec).
+  db.prepare(`DELETE FROM vectors_bit WHERE hash_seq = ?`).run(hashSeq);
+  db.prepare(`INSERT INTO vectors_bit (hash_seq, embedding) VALUES (?, vec_quantize_binary(?))`).run(hashSeq, cutBuf);
+  db.prepare(`INSERT OR REPLACE INTO vectors_rescore (hash_seq, emb) VALUES (?, ?)`).run(hashSeq, quantizeInt8(embedding));
+}
+
+/**
+ * Rebuild the quantized tables (bit coarse + int8 rescore) from the existing
+ * float vectors_vec. Purely local — no embedding/cloud calls. Used by
+ * `qmd embed --requantize` to migrate an already-embedded index, or to rebuild
+ * after changing QMD_VEC_CUT_DIM.
+ *
+ * Reads through a second connection so the forward-only scan of vectors_vec can
+ * run concurrently with batched writes (WAL is enabled in initializeDatabase).
+ */
+export function requantizeFromFloat(
+  db: Database,
+  dbPath: string,
+  onProgress?: (done: number, total: number) => void,
+): { count: number; total: number } {
+  if (!isSqliteVecAvailable()) {
+    throw createSqliteVecUnavailableError(_sqliteVecUnavailableReason ?? "vector operations require sqlite-vec");
+  }
+  const info = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
+  if (!info) throw new Error("No float vectors found (vectors_vec). Run 'qmd embed' first.");
+  const fm = info.sql.match(/float\[(\d+)\]/);
+  const fullDim = fm?.[1] ? parseInt(fm[1], 10) : 0;
+  if (!fullDim) throw new Error("Cannot determine embedding dimension from vectors_vec.");
+
+  const cutDim = effectiveCutDim(fullDim, getVecQuantConfig().cutDim);
+  if (cutDim === 0) {
+    throw new Error(`Embedding dimension ${fullDim} is too small to quantize (need >= 8).`);
+  }
+
+  // Fresh tables sized for the current cut dim.
+  db.exec("DROP TABLE IF EXISTS vectors_bit");
+  db.exec(`CREATE VIRTUAL TABLE vectors_bit USING vec0(hash_seq TEXT PRIMARY KEY, embedding bit[${cutDim}])`);
+  db.exec(`CREATE TABLE IF NOT EXISTS vectors_rescore (hash_seq TEXT PRIMARY KEY, emb BLOB NOT NULL) WITHOUT ROWID`);
+  db.exec(`DELETE FROM vectors_rescore`);
+
+  const total = (db.prepare(`SELECT count(*) AS c FROM vectors_vec`).get() as { c: number }).c;
+
+  const insBit = db.prepare(`INSERT INTO vectors_bit (hash_seq, embedding) VALUES (?, vec_quantize_binary(?))`);
+  const insRsc = db.prepare(`INSERT OR REPLACE INTO vectors_rescore (hash_seq, emb) VALUES (?, ?)`);
+  const writeBatch = db.transaction((batch: { hash_seq: string; embedding: Buffer }[]) => {
+    for (const r of batch) {
+      const full = new Float32Array(r.embedding.buffer, r.embedding.byteOffset, r.embedding.length / 4);
+      insBit.run(r.hash_seq, f32ToBuffer(truncRenorm(full, cutDim)));
+      insRsc.run(r.hash_seq, quantizeInt8(full));
+    }
+  });
+
+  // Separate reader connection: better-sqlite3 forbids running writes while an
+  // iterator from the same connection is open. WAL lets them run concurrently.
+  const reader = openDatabase(dbPath);
+  try {
+    loadSqliteVec(reader);
+    const PAGE = 5000;
+    let buf: { hash_seq: string; embedding: Buffer }[] = [];
+    let done = 0;
+    const rowIter = (reader.prepare(`SELECT hash_seq, embedding FROM vectors_vec`) as any).iterate() as Iterable<{ hash_seq: string; embedding: Buffer }>;
+    for (const row of rowIter) {
+      buf.push({ hash_seq: row.hash_seq, embedding: row.embedding });
+      if (buf.length >= PAGE) {
+        writeBatch(buf);
+        done += buf.length;
+        buf = [];
+        onProgress?.(done, total);
+      }
+    }
+    if (buf.length > 0) {
+      writeBatch(buf);
+      done += buf.length;
+      onProgress?.(done, total);
+    }
+    return { count: done, total };
+  } finally {
+    reader.close();
+  }
 }
 
 // =============================================================================

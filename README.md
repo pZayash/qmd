@@ -590,6 +590,39 @@ When running `qmd embed`, QMD also checks a `.env` file in the current working
 directory. Resolution order is: process environment first, then `.env`, then the
 default timeout.
 
+### Vector search performance (quantization)
+
+By default QMD runs a **quantized two-pass** vector search instead of a
+brute-force scan of full-precision vectors:
+
+1. a binary `bit[cutDim]` coarse hamming knn (Matryoshka-truncated query), then
+2. an exact `int8[fullDim]` cosine rescore over the candidate pool.
+
+On a large corpus (e.g. 223k×4096d) this turns a ~3 s vector lookup into tens of
+milliseconds (~30–50x) at ~96% recall@10. The full-precision `float` vectors are
+kept untouched as an exact fallback.
+
+```sh
+# Rebuild the quantized tables from an already-embedded index (local, no re-embed)
+qmd embed --requantize
+
+# Disable quantization and use the exact float scan
+QMD_VEC_QUANT=0 qmd vsearch "concept"
+```
+
+Tuning env vars:
+
+- `QMD_VEC_QUANT` — `1` (default) enables quantized search; `0` forces exact float.
+- `QMD_VEC_CUT_DIM` — coarse Matryoshka dimension (default `1024`, floored to a
+  multiple of 8). Lower = faster/smaller, slightly lower recall. Changing this
+  requires `qmd embed --requantize`.
+- `QMD_VEC_OVERSAMPLE` — coarse candidate pool multiplier (default `8`). Higher =
+  better recall, slower rescore.
+
+`qmd status` shows the active vector-search mode and warns when the quantized
+tables are missing (search falls back to the exact scan until you run
+`qmd embed --requantize`).
+
 **AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
 files at function, class, and import boundaries instead of arbitrary text
 positions. This produces higher-quality chunks and better search results for

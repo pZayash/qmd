@@ -51,4 +51,12 @@ export class Maintenance {
   clearEmbeddings(): void {
     clearAllEmbeddings(this.store.db);
   }
+
+  /**
+   * Rebuild the quantized vector tables (bit coarse + int8 rescore) from the
+   * existing float vectors. Local only — no embedding/cloud calls.
+   */
+  requantizeVectors(onProgress?: (done: number, total: number) => void): { count: number; total: number } {
+    return this.store.requantizeFromFloat(onProgress);
+  }
 }
