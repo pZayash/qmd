@@ -1,0 +1,16 @@
+{
+  "version": "1.0.0",
+  "project": "qmd",
+  "description": "Query Markup Documents — on-device hybrid search for markdown and code",
+  "language": "en",
+  "framework": "typescript",
+  "specs": {
+    "path": "openspec/specs"
+  },
+  "changes": {
+    "path": "openspec/changes",
+    "archive": "openspec/changes/archive"
+  },
+  "authors": ["Zayash"],
+  "created": "2026-06-12"
+}

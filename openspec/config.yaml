@@ -1,0 +1,18 @@
+schema: spec-driven
+
+context: |
+  QMD: TypeScript CLI/MCP for local hybrid search (BM25 + vectors + rerank).
+  Package manager: pnpm. Tests: vitest in test/. Build: tsc → dist/.
+  Never auto-run qmd collection add / embed / update. Never edit index SQLite directly.
+
+rules:
+  proposal:
+    - End proposal.md with an «Artifacts» section (table of contents) linking all change files — Markdown relative paths only, e.g. [design.md](design.md), [tasks.md](tasks.md), [specs/name/spec.md](specs/name/spec.md). No Obsidian wikilinks.
+    - If proposal.md is created before other artifacts, update it before finalize — sync «Artifacts» with `openspec status` / actual directory listing.
+  tasks:
+    - Do not include git commit, commit message, staging, push, branch, or PR items in tasks.md — only on explicit user request outside OpenSpec.
+    - "Write concrete implementation steps: WHAT, WHERE (file/module), HOW (functions/APIs to touch). Executor may be a weaker model — explicit steps, not boundaries only."
+    - "Each step is a verifiable checkbox `- [ ]` with a clear done condition."
+  apply:
+    - "Optional implementation-notes.md — Markdown only; create when deviating from spec/design/tasks (see docs/ai/openspec-implementation-notes.md). Idea © Thariq (@trq212)."
+    - "Before archive change do not move implementation-notes.md into archive/ — user reviews and deletes."

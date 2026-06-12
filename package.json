@@ -69,6 +69,7 @@
     "tree-sitter-typescript": "0.23.2"
   },
   "devDependencies": {
+    "@fission-ai/openspec": "^1.4.1",
     "@types/better-sqlite3": "7.6.13",
     "tree-sitter-bsl": "0.1.7",
     "tsx": "4.21.0",
