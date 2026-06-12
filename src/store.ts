@@ -35,6 +35,7 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import type { LinkRef } from "./links.js";
 
 // =============================================================================
 // Configuration
@@ -893,6 +894,33 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS link_refs (
+      hash TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      raw_target TEXT NOT NULL,
+      anchor TEXT,
+      PRIMARY KEY (hash, seq),
+      FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS doc_edges (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      collection TEXT NOT NULL,
+      src_doc_id INTEGER NOT NULL,
+      dst_doc_id INTEGER,
+      kind TEXT NOT NULL,
+      raw_target TEXT NOT NULL,
+      FOREIGN KEY (src_doc_id) REFERENCES documents(id) ON DELETE CASCADE
+    )
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_edges_dst ON doc_edges(dst_doc_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_edges_src ON doc_edges(src_doc_id, collection)`);
+
   // Rescore store for quantized vector search — holds the full-dimension int8
   // vectors keyed by hash_seq. Plain B-tree (WITHOUT ROWID) so candidate fetch
   // by primary key is fast (vec0 random PK access is ~30x slower). See
@@ -1459,8 +1487,14 @@ export async function reindexCollection(
         } else {
           unchanged++;
         }
+        if (!hasLinkRefsForHash(db, hash)) {
+          const { extractLinkRefs } = await import("./links.js");
+          insertLinkRefs(db, hash, extractLinkRefs(content));
+        }
       } else {
         insertContent(db, hash, content, now);
+        const { extractLinkRefs } = await import("./links.js");
+        insertLinkRefs(db, hash, extractLinkRefs(content));
         const stat = statSync(filepath);
         updateDocument(db, existing.id, title, hash,
           stat ? new Date(stat.mtime).toISOString() : now);
@@ -1469,6 +1503,8 @@ export async function reindexCollection(
     } else {
       indexed++;
       insertContent(db, hash, content, now);
+      const { extractLinkRefs } = await import("./links.js");
+      insertLinkRefs(db, hash, extractLinkRefs(content));
       const stat = statSync(filepath);
       insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
@@ -1488,6 +1524,8 @@ export async function reindexCollection(
       removed++;
     }
   }
+
+  resolveDocEdges(db, collectionName);
 
   const orphanedCleaned = cleanupOrphanedContent(db);
 
@@ -2327,6 +2365,333 @@ export function insertContent(db: Database, hash: string, content: string, creat
 /**
  * Insert a new document into the documents table.
  */
+// =============================================================================
+// Link graph
+// =============================================================================
+
+export type DocEdge = {
+  kind: string;
+  rawTarget: string;
+  dstDocId: number | null;
+  dstPath: string | null;
+  dstTitle: string | null;
+};
+
+export type BacklinkEdge = {
+  kind: string;
+  rawTarget: string;
+  srcDocId: number;
+  srcPath: string;
+  srcTitle: string;
+};
+
+export type DanglingEdge = {
+  kind: string;
+  rawTarget: string;
+  srcDocId: number;
+  srcPath: string;
+  collection: string;
+};
+
+export function hasLinkRefsForHash(db: Database, hash: string): boolean {
+  const row = db.prepare(`SELECT 1 AS ok FROM link_refs WHERE hash = ? LIMIT 1`).get(hash) as { ok: number } | undefined;
+  return row !== undefined;
+}
+
+export function deleteLinkRefsForHash(db: Database, hash: string): void {
+  db.prepare(`DELETE FROM link_refs WHERE hash = ?`).run(hash);
+}
+
+export function insertLinkRefs(db: Database, hash: string, refs: LinkRef[]): void {
+  deleteLinkRefsForHash(db, hash);
+  if (refs.length === 0) return;
+  const insert = db.prepare(`
+    INSERT INTO link_refs (hash, seq, kind, raw_target, anchor)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const insertMany = db.transaction((items: LinkRef[]) => {
+    for (let seq = 0; seq < items.length; seq++) {
+      const ref = items[seq]!;
+      insert.run(hash, seq, ref.kind, ref.rawTarget, ref.anchor);
+    }
+  });
+  insertMany(refs);
+}
+
+export type BackfillLinkRefsResult = {
+  hashesProcessed: number;
+  refsWritten: number;
+  collectionsResolved: string[];
+};
+
+/**
+ * Extract link refs from indexed content already in SQLite (no filesystem scan).
+ * Use after upgrading to link-graph when documents were indexed before extraction existed.
+ */
+export async function backfillLinkRefs(
+  db: Database,
+  collectionName?: string,
+  options?: { force?: boolean; onProgress?: (done: number, total: number) => void },
+): Promise<BackfillLinkRefsResult> {
+  const { extractLinkRefs } = await import("./links.js");
+  const rows = (collectionName
+    ? db.prepare(`
+        SELECT DISTINCT d.collection, d.hash, c.doc
+        FROM documents d
+        JOIN content c ON d.hash = c.hash
+        WHERE d.collection = ? AND d.active = 1
+      `).all(collectionName)
+    : db.prepare(`
+        SELECT DISTINCT d.collection, d.hash, c.doc
+        FROM documents d
+        JOIN content c ON d.hash = c.hash
+        WHERE d.active = 1
+      `).all()) as { collection: string; hash: string; doc: string }[];
+
+  const collections = new Set<string>();
+  let hashesProcessed = 0;
+  let refsWritten = 0;
+  const total = rows.length;
+
+  let scanned = 0;
+  const backfill = db.transaction((batch: typeof rows) => {
+    for (const row of batch) {
+      scanned++;
+      if (!options?.force && hasLinkRefsForHash(db, row.hash)) {
+        options?.onProgress?.(scanned, total);
+        continue;
+      }
+      const refs = extractLinkRefs(row.doc);
+      insertLinkRefs(db, row.hash, refs);
+      collections.add(row.collection);
+      hashesProcessed++;
+      refsWritten += refs.length;
+      options?.onProgress?.(scanned, total);
+    }
+  });
+  backfill(rows);
+
+  const collectionsResolved: string[] = [];
+  for (const name of collections) {
+    resolveDocEdges(db, name);
+    collectionsResolved.push(name);
+  }
+
+  // When skipping all hashes (already backfilled), still resolve requested collection
+  if (collectionsResolved.length === 0 && collectionName) {
+    resolveDocEdges(db, collectionName);
+    collectionsResolved.push(collectionName);
+  } else if (collectionsResolved.length === 0 && !collectionName) {
+    const allCollections = db.prepare(`
+      SELECT DISTINCT collection FROM documents WHERE active = 1
+    `).all() as { collection: string }[];
+    for (const { collection } of allCollections) {
+      resolveDocEdges(db, collection);
+      collectionsResolved.push(collection);
+    }
+  }
+
+  return { hashesProcessed, refsWritten, collectionsResolved };
+}
+
+function getLinkRefsForHash(db: Database, hash: string): LinkRef[] {
+  const rows = db.prepare(`
+    SELECT kind, raw_target, anchor
+    FROM link_refs
+    WHERE hash = ?
+    ORDER BY seq
+  `).all(hash) as { kind: string; raw_target: string; anchor: string | null }[];
+
+  return rows.map(row => ({
+    kind: row.kind as LinkRef["kind"],
+    rawTarget: row.raw_target,
+    anchor: row.anchor,
+  }));
+}
+
+function pathBasename(path: string): string {
+  const name = path.split("/").pop() || path;
+  return name.replace(/\.[^.]+$/, "");
+}
+
+function resolveCollectionRelativePath(sourcePath: string, rawTarget: string): string {
+  const target = normalizePathSeparators(rawTarget);
+  const sourceDir = sourcePath.includes("/")
+    ? sourcePath.slice(0, sourcePath.lastIndexOf("/"))
+    : "";
+  const combined = sourceDir ? `${sourceDir}/${target}` : target;
+  const parts = combined.split("/").filter(p => p.length > 0);
+  const normalized: string[] = [];
+  for (const part of parts) {
+    if (part === "..") normalized.pop();
+    else if (part !== ".") normalized.push(part);
+  }
+  // Match documents.path as stored — do not handelize (dotfiles like .gitignore fail handelize).
+  return normalized.join("/");
+}
+
+type DocCandidate = { docId: number; path: string };
+
+function addCandidate(map: Map<string, DocCandidate[]>, key: string, candidate: DocCandidate): void {
+  const list = map.get(key);
+  if (list) {
+    if (!list.some(c => c.docId === candidate.docId)) list.push(candidate);
+  } else {
+    map.set(key, [candidate]);
+  }
+}
+
+function pickShortestPathDocId(candidates: DocCandidate[]): number | null {
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => a.path.length - b.path.length || a.path.localeCompare(b.path));
+  return candidates[0]!.docId;
+}
+
+function resolveWikilinkTarget(
+  rawTarget: string,
+  titleIndex: Map<string, DocCandidate[]>,
+  basenameIndex: Map<string, DocCandidate[]>,
+): number | null {
+  const seen = new Map<number, DocCandidate>();
+  for (const c of [...(titleIndex.get(rawTarget) ?? []), ...(basenameIndex.get(rawTarget) ?? [])]) {
+    seen.set(c.docId, c);
+  }
+  return pickShortestPathDocId([...seen.values()]);
+}
+
+export function resolveDocEdges(db: Database, collectionName: string): void {
+  db.prepare(`DELETE FROM doc_edges WHERE collection = ?`).run(collectionName);
+
+  const activeDocs = db.prepare(`
+    SELECT id, path, title, hash
+    FROM documents
+    WHERE collection = ? AND active = 1
+  `).all(collectionName) as { id: number; path: string; title: string; hash: string }[];
+
+  const pathIndex = new Map<string, number>();
+  const titleIndex = new Map<string, DocCandidate[]>();
+  const basenameIndex = new Map<string, DocCandidate[]>();
+
+  for (const doc of activeDocs) {
+    pathIndex.set(doc.path, doc.id);
+    addCandidate(titleIndex, doc.title, { docId: doc.id, path: doc.path });
+    addCandidate(basenameIndex, pathBasename(doc.path), { docId: doc.id, path: doc.path });
+  }
+
+  const insertEdge = db.prepare(`
+    INSERT INTO doc_edges (collection, src_doc_id, dst_doc_id, kind, raw_target)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+
+  const insertMany = db.transaction(() => {
+    for (const doc of activeDocs) {
+      const refs = getLinkRefsForHash(db, doc.hash);
+      for (const ref of refs) {
+        let dstDocId: number | null = null;
+        if (ref.kind === "mdlink") {
+          const resolvedPath = resolveCollectionRelativePath(doc.path, ref.rawTarget);
+          dstDocId = pathIndex.get(resolvedPath) ?? null;
+        } else {
+          dstDocId = resolveWikilinkTarget(ref.rawTarget, titleIndex, basenameIndex);
+        }
+        insertEdge.run(collectionName, doc.id, dstDocId, ref.kind, ref.rawTarget);
+      }
+    }
+  });
+  insertMany();
+}
+
+export function getOutEdges(db: Database, docId: number): DocEdge[] {
+  const rows = db.prepare(`
+    SELECT e.kind, e.raw_target, e.dst_doc_id, d.path AS dst_path, d.title AS dst_title
+    FROM doc_edges e
+    LEFT JOIN documents d ON e.dst_doc_id = d.id
+    WHERE e.src_doc_id = ?
+    ORDER BY e.id
+  `).all(docId) as {
+    kind: string;
+    raw_target: string;
+    dst_doc_id: number | null;
+    dst_path: string | null;
+    dst_title: string | null;
+  }[];
+
+  return rows.map(row => ({
+    kind: row.kind,
+    rawTarget: row.raw_target,
+    dstDocId: row.dst_doc_id,
+    dstPath: row.dst_path,
+    dstTitle: row.dst_title,
+  }));
+}
+
+export function getBacklinks(db: Database, docId: number): BacklinkEdge[] {
+  const rows = db.prepare(`
+    SELECT e.kind, e.raw_target, e.src_doc_id, s.path AS src_path, s.title AS src_title
+    FROM doc_edges e
+    JOIN documents s ON e.src_doc_id = s.id
+    WHERE e.dst_doc_id = ?
+    ORDER BY e.id
+  `).all(docId) as {
+    kind: string;
+    raw_target: string;
+    src_doc_id: number;
+    src_path: string;
+    src_title: string;
+  }[];
+
+  return rows.map(row => ({
+    kind: row.kind,
+    rawTarget: row.raw_target,
+    srcDocId: row.src_doc_id,
+    srcPath: row.src_path,
+    srcTitle: row.src_title,
+  }));
+}
+
+export function getDanglingEdges(db: Database, collection?: string): DanglingEdge[] {
+  const rows = collection
+    ? db.prepare(`
+        SELECT e.kind, e.raw_target, e.src_doc_id, s.path AS src_path, e.collection
+        FROM doc_edges e
+        JOIN documents s ON e.src_doc_id = s.id
+        WHERE e.dst_doc_id IS NULL AND e.collection = ?
+        ORDER BY e.collection, s.path, e.id
+      `).all(collection) as {
+        kind: string;
+        raw_target: string;
+        src_doc_id: number;
+        src_path: string;
+        collection: string;
+      }[]
+    : db.prepare(`
+        SELECT e.kind, e.raw_target, e.src_doc_id, s.path AS src_path, e.collection
+        FROM doc_edges e
+        JOIN documents s ON e.src_doc_id = s.id
+        WHERE e.dst_doc_id IS NULL
+        ORDER BY e.collection, s.path, e.id
+      `).all() as {
+        kind: string;
+        raw_target: string;
+        src_doc_id: number;
+        src_path: string;
+        collection: string;
+      }[];
+
+  return rows.map(row => ({
+    kind: row.kind,
+    rawTarget: row.raw_target,
+    srcDocId: row.src_doc_id,
+    srcPath: row.src_path,
+    collection: row.collection,
+  }));
+}
+
+export function getDocumentId(db: Database, collectionName: string, path: string): number | null {
+  const row = findActiveDocument(db, collectionName, path);
+  return row?.id ?? null;
+}
+
 export function insertDocument(
   db: Database,
   collectionName: string,

@@ -33,7 +33,14 @@ import {
   type SearchResult,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
-import { enableProductionMode } from "../store.js";
+import {
+  enableProductionMode,
+  findDocument,
+  getDocumentId,
+  getOutEdges,
+  getBacklinks,
+  getDanglingEdges,
+} from "../store.js";
 import {
   searchResultsToJson,
   searchResultsToCsv,
@@ -168,6 +175,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   lines.push("Retrieval:");
   lines.push("  - `get` — single document by path or docid (#abc123). Supports line offset (`file.md:100`).");
   lines.push("  - `multi_get` — batch retrieve by glob (`journals/2025-05*.md`) or comma-separated list.");
+  lines.push("  - `links` — 1-hop out-links, backlinks, and dangling edges for a document.");
 
   // --- Non-obvious things that prevent mistakes ---
   lines.push("");
@@ -507,6 +515,71 @@ Intent-aware lex (C++ performance, not sports):
       }
 
       return { content };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: links
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "links",
+    {
+      title: "Document Links",
+      description: "Retrieve 1-hop out-links, backlinks, and dangling edges for a document. Use view:'dangling' for collection-wide broken links.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        doc: z.string().optional().describe("Document path or docid (#abc123). Omit with view:'dangling' for collection-wide broken links."),
+        collection: z.string().optional().describe("Collection name filter (especially for dangling view)"),
+        view: z.enum(["out", "backlinks", "dangling", "all"]).optional().default("all").describe("Which link view to return"),
+      },
+    },
+    async ({ doc, collection, view = "all" }) => {
+      const db = store.internal.db;
+
+      if (view === "dangling" || !doc) {
+        const dangling = getDanglingEdges(db, collection);
+        return {
+          content: [{ type: "text", text: JSON.stringify({ dangling }, null, 2) }],
+          structuredContent: { dangling },
+        };
+      }
+
+      const found = findDocument(db, doc);
+      if ("error" in found) {
+        return {
+          content: [{ type: "text", text: `Document not found: ${doc}` }],
+          isError: true,
+        };
+      }
+
+      const prefix = `${found.collectionName}/`;
+      const relPath = found.displayPath.startsWith(prefix)
+        ? found.displayPath.slice(prefix.length)
+        : found.displayPath;
+      const docId = getDocumentId(db, found.collectionName, relPath);
+      if (docId === null) {
+        return {
+          content: [{ type: "text", text: `Document not found: ${doc}` }],
+          isError: true,
+        };
+      }
+
+      const payload: Record<string, unknown> = { doc: found.displayPath, docid: found.docid };
+      if (view === "out" || view === "all") {
+        payload.out = getOutEdges(db, docId);
+      }
+      if (view === "backlinks" || view === "all") {
+        payload.backlinks = getBacklinks(db, docId);
+      }
+      if (view === "all") {
+        payload.dangling = getOutEdges(db, docId).filter(e => e.dstDocId === null);
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        structuredContent: payload,
+      };
     }
   );
 

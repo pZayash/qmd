@@ -21,6 +21,11 @@
   after changing `QMD_VEC_CUT_DIM`. `qmd status` shows the vector-search mode and
   warns when the quant tables are empty (search falls back to the exact scan
   until then).
+- Cross-document link graph: extract `[[wikilinks]]` and relative markdown links
+  during reindex; resolve 1-hop edges (out-links, backlinks, dangling). CLI
+  `qmd links <doc>` with `--dangling`, `--backfill`, `-c`, `--json`; MCP `links`
+  tool. After upgrading an existing index, run `qmd links --backfill` once (unchanged
+  hashes skip extraction on a normal `qmd update`).
 
 ### Fixes
 

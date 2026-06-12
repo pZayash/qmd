@@ -25,6 +25,8 @@ qmd context check                 # Check for collections/paths missing context
 qmd context rm <path>             # Remove context
 qmd get <file>                    # Get document by path or docid (#abc123)
 qmd multi-get <pattern>           # Get multiple docs by glob or comma-separated list
+qmd links <doc> [--dangling]      # Out-links, backlinks, broken links (-c collection, --json)
+qmd links --backfill [-c name]    # Extract links from indexed content (post-upgrade backfill)
 qmd status                        # Show index status and collections
 qmd update [--pull]               # Re-index all collections (--pull: git pull first)
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
@@ -172,6 +174,13 @@ bun test --preload ./src/test-preload.ts test/
 - Reciprocal Rank Fusion (RRF) for combining results
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
 - AST-aware chunking: use `--chunk-strategy auto` to chunk code files (.ts/.js/.py/.go/.rs/.bsl/.osl) at function/class/import boundaries via tree-sitter (BSL wasm vendored in `assets/grammars/`). Default is `regex` (existing behavior). Markdown and unknown file types always use regex chunking. SDBL (`.sdbl`) not supported for AST chunking.
+
+## Link graph
+
+Cross-doc links (`[[wikilinks]]`, relative `[md](./x.md)`) build during `qmd update`
+when content hash changes. After upgrading link-graph on an existing index, run
+`qmd links --backfill` (or `qmd update` — unchanged docs backfill missing refs
+on disk pass). No auto-run. `--force-links` re-extracts all bodies from index.
 
 ## Important: Do NOT run automatically
 

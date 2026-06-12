@@ -41,6 +41,10 @@ qmd query "quarterly planning process"  # Hybrid + reranking (best quality)
 # Get a specific document
 qmd get "meetings/2024-01-15.md"
 
+# Explore cross-document links (wikilinks + relative md links)
+qmd links "notes/setup.md"
+qmd links --dangling -c notes   # collection-wide broken links
+
 # Get a document by docid (shown in search results)
 qmd get "#abc123"
 
@@ -77,7 +81,11 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 - `query` — Search with typed sub-queries (`lex`/`vec`/`hyde`), combined via RRF + reranking
 - `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
 - `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
+- `links` — 1-hop out-links, backlinks, and dangling edges for a document
 - `status` — Index health and collection info
+
+Link graph populates on `qmd update` (not retroactively on upgrade). Run `qmd update`
+after upgrading if you want `qmd links` / the MCP `links` tool to see edges.
 
 **Claude Desktop configuration** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 

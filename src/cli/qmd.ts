@@ -22,8 +22,14 @@ import {
   removeCollection,
   renameCollection,
   findSimilarFiles,
+  findDocument,
   findDocumentByDocid,
   isDocid,
+  getOutEdges,
+  getBacklinks,
+  getDanglingEdges,
+  getDocumentId,
+  backfillLinkRefs,
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   clearAllEmbeddings,
@@ -2695,6 +2701,9 @@ function parseCLI() {
       "chunk-strategy": { type: "string" },  // "regex" (default) or "auto" (AST for code files)
       // Rebuild quantized vector tables from existing float vectors (no re-embed)
       requantize: { type: "boolean", default: false },
+      dangling: { type: "boolean" },
+      backfill: { type: "boolean" },
+      "force-links": { type: "boolean" },
       // MCP HTTP transport options
       http: { type: "boolean" },
       daemon: { type: "boolean" },
@@ -2875,6 +2884,130 @@ async function installSkill(globalInstall: boolean, force: boolean, autoYes: boo
   }
 }
 
+function collectionRelativePath(collectionName: string, displayPath: string): string {
+  const prefix = `${collectionName}/`;
+  return displayPath.startsWith(prefix) ? displayPath.slice(prefix.length) : displayPath;
+}
+
+async function showLinks(
+  docArg: string | undefined,
+  options: { dangling?: boolean; backfill?: boolean; forceLinks?: boolean; collection?: string | string[]; json?: boolean },
+): Promise<void> {
+  const db = getDb();
+  const collectionFilter = Array.isArray(options.collection)
+    ? options.collection[0]
+    : options.collection;
+
+  if (options.backfill) {
+    const start = Date.now();
+    const result = await backfillLinkRefs(db, collectionFilter, {
+      force: options.forceLinks,
+      onProgress: (done, total) => {
+        if (isTTY) process.stderr.write(`\rLink backfill: ${done}/${total}        `);
+      },
+    });
+    if (isTTY) process.stderr.write("\n");
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    console.log(
+      `Link backfill: ${result.hashesProcessed} hash(es), ${result.refsWritten} ref(s), ` +
+      `${result.collectionsResolved.length} collection(s) resolved (${elapsed}s)`,
+    );
+    closeDb();
+    return;
+  }
+
+  if (options.dangling) {
+    const dangling = getDanglingEdges(db, collectionFilter);
+    if (options.json) {
+      console.log(JSON.stringify({ dangling }, null, 2));
+      closeDb();
+      return;
+    }
+    if (dangling.length === 0) {
+      console.log(collectionFilter
+        ? `No dangling links in collection "${collectionFilter}".`
+        : "No dangling links.");
+      closeDb();
+      return;
+    }
+    console.log(`Dangling links${collectionFilter ? ` (${collectionFilter})` : ""}:`);
+    for (const edge of dangling) {
+      const src = `${edge.collection}/${edge.srcPath}`;
+      console.log(`  ${src} → ${edge.rawTarget} (${edge.kind})`);
+    }
+    closeDb();
+    return;
+  }
+
+  if (!docArg) {
+    console.error("Usage: qmd links <doc> [--dangling] [-c collection] [--json]");
+    closeDb();
+    process.exit(1);
+  }
+
+  const doc = findDocument(db, docArg);
+  if ("error" in doc) {
+    console.error(`Document not found: ${docArg}`);
+    if (doc.similarFiles.length > 0) {
+      console.error(`Did you mean: ${doc.similarFiles.join(", ")}`);
+    }
+    closeDb();
+    process.exit(1);
+  }
+
+  const relPath = collectionRelativePath(doc.collectionName, doc.displayPath);
+  const docId = getDocumentId(db, doc.collectionName, relPath);
+  if (docId === null) {
+    console.error(`Document not found: ${docArg}`);
+    closeDb();
+    process.exit(1);
+  }
+
+  const out = getOutEdges(db, docId);
+  const backlinks = getBacklinks(db, docId);
+  const dangling = out.filter(e => e.dstDocId === null);
+
+  if (options.json) {
+    console.log(JSON.stringify({ out, backlinks, dangling }, null, 2));
+    closeDb();
+    return;
+  }
+
+  console.log(`${doc.displayPath} ${c.dim}#${doc.docid}${c.reset}`);
+  console.log("");
+  console.log(`${c.bold}Out-links${c.reset} (${out.length})`);
+  if (out.length === 0) {
+    console.log("  (none)");
+  } else {
+    for (const edge of out) {
+      const dst = edge.dstPath
+        ? `${doc.collectionName}/${edge.dstPath}`
+        : `${c.yellow}dangling${c.reset}: ${edge.rawTarget}`;
+      console.log(`  → ${dst} ${c.dim}(${edge.kind})${c.reset}`);
+    }
+  }
+
+  console.log("");
+  console.log(`${c.bold}Backlinks${c.reset} (${backlinks.length})`);
+  if (backlinks.length === 0) {
+    console.log("  (none)");
+  } else {
+    for (const edge of backlinks) {
+      console.log(`  ← ${doc.collectionName}/${edge.srcPath} ${c.dim}(${edge.kind}: ${edge.rawTarget})${c.reset}`);
+    }
+  }
+
+  if (dangling.length > 0) {
+    console.log("");
+    console.log(`${c.bold}Dangling from this doc${c.reset} (${dangling.length})`);
+    for (const edge of dangling) {
+      console.log(`  ! ${edge.rawTarget} ${c.dim}(${edge.kind})${c.reset}`);
+    }
+  }
+
+  closeDb();
+}
+
 function showHelp(): void {
   console.log("qmd — Quick Markdown Search");
   console.log("");
@@ -2896,6 +3029,7 @@ function showHelp(): void {
   console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
   console.log("  qmd context add/list/rm                      - Attach human-written summaries");
   console.log("  qmd ls [collection[/path]]                   - Inspect indexed files");
+  console.log("  qmd links <doc> [--dangling|--backfill] [-c collection] - Link graph views / backfill from index");
   console.log("");
   console.log("Maintenance:");
   console.log("  qmd status                    - View index + collection health");
@@ -3220,6 +3354,17 @@ if (isMain) {
           console.error("Available: add, list, rm");
           process.exit(1);
       }
+      break;
+    }
+
+    case "links": {
+      await showLinks(cli.args[0], {
+        dangling: Boolean(cli.values.dangling),
+        backfill: Boolean(cli.values.backfill),
+        forceLinks: Boolean(cli.values["force-links"]),
+        collection: cli.opts.collection,
+        json: cli.opts.format === "json",
+      });
       break;
     }
 

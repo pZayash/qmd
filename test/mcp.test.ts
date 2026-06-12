@@ -86,6 +86,33 @@ function initTestDatabase(db: Database): void {
   `);
 
   db.exec(`
+    CREATE TABLE IF NOT EXISTS link_refs (
+      hash TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      raw_target TEXT NOT NULL,
+      anchor TEXT,
+      PRIMARY KEY (hash, seq),
+      FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS doc_edges (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      collection TEXT NOT NULL,
+      src_doc_id INTEGER NOT NULL,
+      dst_doc_id INTEGER,
+      kind TEXT NOT NULL,
+      raw_target TEXT NOT NULL,
+      FOREIGN KEY (src_doc_id) REFERENCES documents(id) ON DELETE CASCADE
+    )
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_edges_dst ON doc_edges(dst_doc_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_edges_src ON doc_edges(src_doc_id, collection)`);
+
+  db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
       name, body,
       content='documents',
@@ -210,6 +237,12 @@ import {
   getDocumentBody,
   findDocuments,
   getStatus,
+  insertLinkRefs,
+  resolveDocEdges,
+  getBacklinks,
+  hashContent,
+  insertContent,
+  insertDocument,
   DEFAULT_EMBED_MODEL,
   DEFAULT_QUERY_MODEL,
   DEFAULT_RERANK_MODEL,
@@ -251,7 +284,7 @@ describe("MCP Server", () => {
     };
     await writeFile(join(testConfigDir, "index.yml"), YAML.stringify(testConfig));
 
-    testDbPath = `/tmp/qmd-mcp-test-${Date.now()}.sqlite`;
+    testDbPath = join(tmpdir(), `qmd-mcp-test-${Date.now()}.sqlite`);
     testDb = openDatabase(testDbPath);
     initTestDatabase(testDb);
     seedTestData(testDb);
@@ -886,6 +919,31 @@ describe("MCP Server", () => {
         expect(typeof col.pattern).toBe("string");
         expect(typeof col.documents).toBe("number");
       }
+    });
+  });
+
+  describe("links tool (backlinks)", () => {
+    test("returns backlinks for a document", async () => {
+      const now = new Date().toISOString();
+      const setupBody = "# Setup\n";
+      const indexBody = "[[Setup]]\n";
+      const setupHash = await hashContent(setupBody);
+      const indexHash = await hashContent(indexBody);
+
+      insertContent(testDb, setupHash, setupBody, now);
+      insertContent(testDb, indexHash, indexBody, now);
+      insertDocument(testDb, "docs", "setup.md", "Setup", setupHash, now, now);
+      insertDocument(testDb, "docs", "index.md", "Index", indexHash, now, now);
+
+      const { extractLinkRefs } = await import("../src/links");
+      insertLinkRefs(testDb, indexHash, extractLinkRefs(indexBody));
+      resolveDocEdges(testDb, "docs");
+
+      const setupId = testDb.prepare(`SELECT id FROM documents WHERE path = 'setup.md'`).get() as { id: number };
+      const backlinks = getBacklinks(testDb, setupId.id);
+      expect(backlinks).toHaveLength(1);
+      expect(backlinks[0]!.srcPath).toBe("index.md");
+      expect(backlinks[0]!.rawTarget).toBe("Setup");
     });
   });
 });
