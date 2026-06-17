@@ -171,6 +171,10 @@ bun test --preload ./src/test-preload.ts test/
   kept as the exact fallback. Tune via `QMD_VEC_QUANT` / `QMD_VEC_CUT_DIM` /
   `QMD_VEC_OVERSAMPLE`; rebuild from existing floats with `qmd embed --requantize`.
 - node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
+- OpenRouter embeddings: `QMD_EMBED_CONCURRENCY` (default `1`) — max concurrent
+  `batchSize` POSTs in `embedBatch`; OpenRouter transport only (local llama stays
+  serial). Higher values raise request rate — subject to provider rate limits; 429
+  backoff honors `Retry-After`.
 - Reciprocal Rank Fusion (RRF) for combining results
 - Smart chunking: 900 tokens/chunk with 15% overlap, prefers markdown headings as boundaries
 - AST-aware chunking: use `--chunk-strategy auto` to chunk code files (.ts/.js/.py/.go/.rs/.bsl/.osl) at function/class/import boundaries via tree-sitter (BSL wasm vendored in `assets/grammars/`). Default is `regex` (existing behavior). Markdown and unknown file types always use regex chunking. SDBL (`.sdbl`) not supported for AST chunking.

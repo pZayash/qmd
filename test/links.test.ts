@@ -5,28 +5,28 @@ describe("extractLinkRefs", () => {
   test("wikilink extracted", () => {
     const refs = extractLinkRefs("See [[Setup Guide]] for details.");
     expect(refs).toEqual([
-      { kind: "wikilink", rawTarget: "Setup Guide", anchor: null },
+      { kind: "wikilink", rawTarget: "Setup Guide", anchor: null, srcAnchor: null },
     ]);
   });
 
   test("wikilink with alias and anchor", () => {
     const refs = extractLinkRefs("[[Setup Guide#install|how to install]]");
     expect(refs).toEqual([
-      { kind: "wikilink", rawTarget: "Setup Guide", anchor: "install" },
+      { kind: "wikilink", rawTarget: "Setup Guide", anchor: "install", srcAnchor: null },
     ]);
   });
 
   test("relative markdown link with anchor", () => {
     const refs = extractLinkRefs("[install](./guide.md#step-1)");
     expect(refs).toEqual([
-      { kind: "mdlink", rawTarget: "./guide.md", anchor: "step-1" },
+      { kind: "mdlink", rawTarget: "./guide.md", anchor: "step-1", srcAnchor: null },
     ]);
   });
 
   test("embed aliased to wikilink", () => {
     const refs = extractLinkRefs("![[Diagram]]");
     expect(refs).toEqual([
-      { kind: "wikilink", rawTarget: "Diagram", anchor: null },
+      { kind: "wikilink", rawTarget: "Diagram", anchor: null, srcAnchor: null },
     ]);
   });
 
@@ -46,7 +46,7 @@ describe("extractLinkRefs", () => {
     ].join("\n");
     const refs = extractLinkRefs(body);
     expect(refs).toEqual([
-      { kind: "wikilink", rawTarget: "Link", anchor: null },
+      { kind: "wikilink", rawTarget: "Link", anchor: null, srcAnchor: null },
     ]);
   });
 });

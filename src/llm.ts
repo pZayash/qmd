@@ -128,6 +128,8 @@ export type EmbedOptions = {
   model?: string;
   isQuery?: boolean;
   title?: string;
+  /** Cancel in-flight embedding requests when aborted */
+  signal?: AbortSignal;
 };
 
 /**

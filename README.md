@@ -594,6 +594,16 @@ export QMD_EMBED_SESSION_MAX_DURATION_SEC=0
 qmd embed
 ```
 
+OpenRouter embedding transport only: raise concurrent HTTP POSTs with
+`QMD_EMBED_CONCURRENCY` (default `1` = serial, same as before). Local
+node-llama-cpp ignores it. Higher values speed up cloud embeds but increase
+request rate against provider quotas (429 backoff applies).
+
+```sh
+export QMD_EMBED_CONCURRENCY=5
+qmd embed
+```
+
 When running `qmd embed`, QMD also checks a `.env` file in the current working
 directory. Resolution order is: process environment first, then `.env`, then the
 default timeout.

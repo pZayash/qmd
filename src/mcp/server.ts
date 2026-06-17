@@ -40,7 +40,9 @@ import {
   getOutEdges,
   getBacklinks,
   getDanglingEdges,
+  isDocid,
 } from "../store.js";
+import { slugifyAnchor } from "../links.js";
 import {
   searchResultsToJson,
   searchResultsToCsv,
@@ -526,15 +528,16 @@ Intent-aware lex (C++ performance, not sports):
     "links",
     {
       title: "Document Links",
-      description: "Retrieve 1-hop out-links, backlinks, and dangling edges for a document. Use view:'dangling' for collection-wide broken links.",
+      description: "Retrieve 1-hop out-links, backlinks, and dangling edges for a document. Use doc:'Module#ПроцB' or anchor field for symbol-granular call-graph queries (calls / called by). Use view:'dangling' for collection-wide broken links.",
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
-        doc: z.string().optional().describe("Document path or docid (#abc123). Omit with view:'dangling' for collection-wide broken links."),
+        doc: z.string().optional().describe("Document path, docid (#abc123), or Doc#anchor (e.g. Module#ПроцB). Omit with view:'dangling' for collection-wide broken links."),
+        anchor: z.string().optional().describe("Anchor slug or raw heading text (alternative to Doc#anchor in doc)"),
         collection: z.string().optional().describe("Collection name filter (especially for dangling view)"),
         view: z.enum(["out", "backlinks", "dangling", "all"]).optional().default("all").describe("Which link view to return"),
       },
     },
-    async ({ doc, collection, view = "all" }) => {
+    async ({ doc, anchor, collection, view = "all" }) => {
       const db = store.internal.db;
 
       if (view === "dangling" || !doc) {
@@ -545,7 +548,21 @@ Intent-aware lex (C++ performance, not sports):
         };
       }
 
-      const found = findDocument(db, doc);
+      let docLookup = doc;
+      let anchorSlug: string | undefined = anchor ? slugifyAnchor(anchor) : undefined;
+      if (!anchorSlug && !isDocid(doc)) {
+        const hashIdx = doc.indexOf("#");
+        if (hashIdx !== -1) {
+          const docPart = doc.slice(0, hashIdx);
+          const anchorPart = doc.slice(hashIdx + 1).trim();
+          if (docPart && anchorPart) {
+            docLookup = docPart;
+            anchorSlug = slugifyAnchor(anchorPart);
+          }
+        }
+      }
+
+      const found = findDocument(db, docLookup);
       if ("error" in found) {
         return {
           content: [{ type: "text", text: `Document not found: ${doc}` }],
@@ -566,13 +583,14 @@ Intent-aware lex (C++ performance, not sports):
       }
 
       const payload: Record<string, unknown> = { doc: found.displayPath, docid: found.docid };
+      if (anchorSlug) payload.anchor = anchorSlug;
       if (view === "out" || view === "all") {
-        payload.out = getOutEdges(db, docId);
+        payload.out = getOutEdges(db, docId, anchorSlug);
       }
       if (view === "backlinks" || view === "all") {
-        payload.backlinks = getBacklinks(db, docId);
+        payload.backlinks = getBacklinks(db, docId, anchorSlug);
       }
-      if (view === "all") {
+      if (view === "all" && !anchorSlug) {
         payload.dangling = getOutEdges(db, docId).filter(e => e.dstDocId === null);
       }
 

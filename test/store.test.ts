@@ -2852,24 +2852,26 @@ describe("Embedding batching", () => {
     };
   }
 
-  function createFakeEmbedLlm() {
+  function createFakeEmbedLlm(embedModelName = "fake-embed") {
     const embedBatchCalls: string[][] = [];
-    const embedCalls: { text: string; options?: { model?: string } }[] = [];
-    const embedBatchModelCalls: ({ model?: string } | undefined)[] = [];
+    const embedCalls: { text: string; options?: { model?: string; signal?: AbortSignal } }[] = [];
+    const embedBatchModelCalls: ({ model?: string; signal?: AbortSignal } | undefined)[] = [];
     return {
+      embedModelName,
+      preferredEmbedBatchSize: 32,
       embedBatchCalls,
       embedCalls,
       embedBatchModelCalls,
-      async embed(text: string, options?: { model?: string }) {
+      async embed(text: string, options?: { model?: string; signal?: AbortSignal }) {
         embedCalls.push({ text, options });
-        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+        return { embedding: [0.1, 0.2, 0.3], model: embedModelName };
       },
-      async embedBatch(texts: string[], options?: { model?: string }) {
+      async embedBatch(texts: string[], options?: { model?: string; signal?: AbortSignal }) {
         embedBatchCalls.push([...texts]);
         embedBatchModelCalls.push(options);
         return texts.map((_text, index) => ({
           embedding: [index + 1, index + 2, index + 3],
-          model: "fake-embed",
+          model: embedModelName,
         }));
       },
     };
@@ -2942,8 +2944,8 @@ describe("Embedding batching", () => {
   test("generateEmbeddings passes the selected model through to embed calls and metadata", async () => {
     const store = await createTestStore();
     const db = store.db;
-    const fakeLlm = createFakeEmbedLlm();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+    const fakeLlm = createFakeEmbedLlm(model);
 
     setDefaultLlamaCpp(createFakeTokenizer() as any);
     store.llm = fakeLlm as any;
@@ -2955,7 +2957,9 @@ describe("Embedding batching", () => {
 
       expect(result.chunksEmbedded).toBe(1);
       expect(fakeLlm.embedCalls[0]?.options?.model).toBe(model);
-      expect(fakeLlm.embedBatchModelCalls).toEqual([{ model }]);
+      expect(fakeLlm.embedCalls[0]?.options?.signal).toBeInstanceOf(AbortSignal);
+      expect(fakeLlm.embedBatchModelCalls[0]?.model).toBe(model);
+      expect(fakeLlm.embedBatchModelCalls[0]?.signal).toBe(fakeLlm.embedCalls[0]?.options?.signal);
       expect(db.prepare(`SELECT DISTINCT model FROM content_vectors`).all()).toEqual([{ model }]);
     } finally {
       setDefaultLlamaCpp(null);

@@ -88,6 +88,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
+import { slugifyAnchor } from "../links.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import { OpenRouterEmbedding } from "../llm-openrouter.js";
 import {
@@ -2889,6 +2890,22 @@ function collectionRelativePath(collectionName: string, displayPath: string): st
   return displayPath.startsWith(prefix) ? displayPath.slice(prefix.length) : displayPath;
 }
 
+function parseLinksDocArg(docArg: string): { docLookup: string; anchorSlug?: string } {
+  if (isDocid(docArg)) {
+    return { docLookup: docArg };
+  }
+  const hashIdx = docArg.indexOf("#");
+  if (hashIdx === -1) {
+    return { docLookup: docArg };
+  }
+  const docLookup = docArg.slice(0, hashIdx);
+  const anchorPart = docArg.slice(hashIdx + 1).trim();
+  if (!docLookup || !anchorPart) {
+    return { docLookup: docArg };
+  }
+  return { docLookup, anchorSlug: slugifyAnchor(anchorPart) };
+}
+
 async function showLinks(
   docArg: string | undefined,
   options: { dangling?: boolean; backfill?: boolean; forceLinks?: boolean; collection?: string | string[]; json?: boolean },
@@ -2910,6 +2927,7 @@ async function showLinks(
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
     console.log(
       `Link backfill: ${result.hashesProcessed} hash(es), ${result.refsWritten} ref(s), ` +
+      `${result.anchorsWritten} anchor(s), ` +
       `${result.collectionsResolved.length} collection(s) resolved (${elapsed}s)`,
     );
     closeDb();
@@ -2933,7 +2951,11 @@ async function showLinks(
     console.log(`Dangling links${collectionFilter ? ` (${collectionFilter})` : ""}:`);
     for (const edge of dangling) {
       const src = `${edge.collection}/${edge.srcPath}`;
-      console.log(`  ${src} → ${edge.rawTarget} (${edge.kind})`);
+      if (edge.danglingKind === "anchor") {
+        console.log(`  ${src} → ${edge.rawTarget}#${edge.anchor ?? "?"} ${c.dim}(anchor-dangling: ${edge.kind})${c.reset}`);
+      } else {
+        console.log(`  ${src} → ${edge.rawTarget} ${c.dim}(${edge.kind})${c.reset}`);
+      }
     }
     closeDb();
     return;
@@ -2945,7 +2967,8 @@ async function showLinks(
     process.exit(1);
   }
 
-  const doc = findDocument(db, docArg);
+  const { docLookup, anchorSlug } = parseLinksDocArg(docArg);
+  const doc = findDocument(db, docLookup);
   if ("error" in doc) {
     console.error(`Document not found: ${docArg}`);
     if (doc.similarFiles.length > 0) {
@@ -2963,18 +2986,47 @@ async function showLinks(
     process.exit(1);
   }
 
-  const out = getOutEdges(db, docId);
-  const backlinks = getBacklinks(db, docId);
+  const out = getOutEdges(db, docId, anchorSlug);
+  const backlinks = getBacklinks(db, docId, anchorSlug);
   const dangling = out.filter(e => e.dstDocId === null);
 
   if (options.json) {
-    console.log(JSON.stringify({ out, backlinks, dangling }, null, 2));
+    console.log(JSON.stringify({ out, backlinks, dangling, anchor: anchorSlug ?? null }, null, 2));
     closeDb();
     return;
   }
 
-  console.log(`${doc.displayPath} ${c.dim}#${doc.docid}${c.reset}`);
+  const anchorLabel = anchorSlug ? `#${anchorSlug}` : "";
+  console.log(`${doc.displayPath}${anchorLabel} ${c.dim}#${doc.docid}${c.reset}`);
   console.log("");
+
+  if (anchorSlug) {
+    console.log(`${c.bold}Calls${c.reset} (${out.length})`);
+    if (out.length === 0) {
+      console.log("  (none)");
+    } else {
+      for (const edge of out) {
+        const dstAnchor = edge.anchor ? `#${edge.anchor}` : "";
+        const dst = edge.dstPath
+          ? `${doc.collectionName}/${edge.dstPath}${dstAnchor}`
+          : `${c.yellow}dangling${c.reset}: ${edge.rawTarget}`;
+        console.log(`  → ${dst} ${c.dim}(${edge.kind})${c.reset}`);
+      }
+    }
+
+    console.log("");
+    console.log(`${c.bold}Called by${c.reset} (${backlinks.length})`);
+    if (backlinks.length === 0) {
+      console.log("  (none)");
+    } else {
+      for (const edge of backlinks) {
+        console.log(`  ← ${doc.collectionName}/${edge.srcPath} ${c.dim}(${edge.kind}: ${edge.rawTarget})${c.reset}`);
+      }
+    }
+    closeDb();
+    return;
+  }
+
   console.log(`${c.bold}Out-links${c.reset} (${out.length})`);
   if (out.length === 0) {
     console.log("  (none)");

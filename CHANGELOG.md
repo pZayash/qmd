@@ -4,6 +4,13 @@
 
 ### Features
 
+- Added: `QMD_EMBED_CONCURRENCY` for parallel OpenRouter embedding with 429
+  backoff and abort propagation (local llama path unchanged).
+
+- Symbol anchor links: resolve `[[Doc#anchor]]` against in-document headings;
+  `qmd links Doc#anchor` returns symbol-granular calls/called-by; anchor-dangling
+  edges surfaced in `--dangling`; backfill populates `doc_anchors` without re-embed.
+
 - Quantized vector search (default): replaces the brute-force `float[N]` scan with
   a two-pass pipeline — a binary `bit[cutDim]` coarse hamming knn (Matryoshka-
   truncated) followed by an exact `int8[fullDim]` cosine rescore over the

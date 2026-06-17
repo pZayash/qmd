@@ -53,8 +53,14 @@ export type EmbeddingOverride = {
 // with no `data` for qwen3-embedding-8b). 64 embeds reliably; override via
 // config models.embedBatchSize.
 const DEFAULT_BATCH_SIZE = 64;
+const DEFAULT_CONCURRENCY = 1;
 const MAX_NETWORK_RETRIES = 2;
+const MAX_RATE_LIMIT_RETRIES = 5;
 const RETRY_BASE_DELAY_MS = 500;
+const RATE_LIMIT_BASE_DELAY_MS = 1000;
+
+/** @internal exposed for tests */
+export { MAX_RATE_LIMIT_RETRIES };
 
 // Normalize a configured URL to a full embeddings endpoint. Accepts a bare base
 // (".../v1") and appends "/embeddings"; passes a full URL through unchanged.
@@ -89,6 +95,63 @@ function overrideFromEnv(): EmbeddingOverride | undefined {
   };
 }
 
+function parseConcurrency(options?: { concurrency?: number }): number {
+  if (options?.concurrency !== undefined) {
+    return options.concurrency >= 1 ? options.concurrency : DEFAULT_CONCURRENCY;
+  }
+  const env = process.env.QMD_EMBED_CONCURRENCY;
+  if (!env) return DEFAULT_CONCURRENCY;
+  const parsed = parseInt(env, 10);
+  if (Number.isNaN(parsed) || parsed < 1) {
+    console.error("[qmd embed] invalid QMD_EMBED_CONCURRENCY, using 1");
+    return DEFAULT_CONCURRENCY;
+  }
+  return parsed;
+}
+
+function abortError(): Error {
+  const err = new Error("The operation was aborted.");
+  err.name = "AbortError";
+  return err;
+}
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      cleanup();
+      reject(abortError());
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function parseRetryAfterMs(resp: Response): number | null {
+  const header = resp.headers.get("retry-after");
+  if (!header) return null;
+  const trimmed = header.trim();
+  const secs = parseInt(trimmed, 10);
+  if (!Number.isNaN(secs) && String(secs) === trimmed) {
+    return secs * 1000;
+  }
+  const date = Date.parse(trimmed);
+  if (!Number.isNaN(date)) {
+    return Math.max(0, date - Date.now());
+  }
+  return null;
+}
+
 // Marks a transport-level failure (network error or HTTP 5xx/429) that warrants
 // failing over to the next endpoint. Terminal errors (4xx, malformed body) are
 // thrown as plain Error and stop the chain.
@@ -114,9 +177,10 @@ async function fetchWithRetry(url: string, init: RequestInit): Promise<Response>
     try {
       return await fetch(url, init);
     } catch (err) {
+      if ((err as Error).name === "AbortError") throw err;
       lastErr = err;
       if (attempt < MAX_NETWORK_RETRIES) {
-        await new Promise(r => setTimeout(r, RETRY_BASE_DELAY_MS * (attempt + 1)));
+        await sleepWithAbort(RETRY_BASE_DELAY_MS * (attempt + 1), init.signal ?? undefined);
       }
     }
   }
@@ -126,6 +190,7 @@ async function fetchWithRetry(url: string, init: RequestInit): Promise<Response>
 export class OpenRouterEmbedding implements LLM {
   private readonly uri: string;
   private readonly batchSize: number;
+  private readonly concurrency: number;
   // Ordered list tried in sequence: failover advances to the next endpoint only
   // on a transport-level failure (network error or HTTP 5xx/429), never on a 4xx
   // (those are config/auth bugs the fallback can't fix).
@@ -133,7 +198,7 @@ export class OpenRouterEmbedding implements LLM {
 
   constructor(
     uri: string,
-    options?: { apiKey?: string; batchSize?: number; fallback?: EmbeddingFallback; override?: EmbeddingOverride },
+    options?: { apiKey?: string; batchSize?: number; concurrency?: number; fallback?: EmbeddingFallback; override?: EmbeddingOverride },
   ) {
     if (!uri.startsWith("openrouter:")) {
       throw new Error(`OpenRouterEmbedding: URI must start with 'openrouter:' (got: ${uri})`);
@@ -141,6 +206,7 @@ export class OpenRouterEmbedding implements LLM {
     this.uri = uri;
     const model = uri.slice("openrouter:".length);
     this.batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE;
+    this.concurrency = parseConcurrency(options);
 
     // Hard override (env wins over option) — sole endpoint, no primary/fallback.
     const override = overrideFromEnv() ?? options?.override;
@@ -193,61 +259,75 @@ export class OpenRouterEmbedding implements LLM {
   // POST to one endpoint. Throws on transport failure (network error / 5xx / 429)
   // so the caller can fail over; throws a terminal error on 4xx or a malformed
   // 200 body (failing over won't help those).
-  private async callEndpoint(ep: Endpoint, input: string | string[]): Promise<OpenRouterEmbeddingResponse> {
+  private async callEndpoint(ep: Endpoint, input: string | string[], signal?: AbortSignal): Promise<OpenRouterEmbeddingResponse> {
     const n = Array.isArray(input) ? input.length : 1;
     embedDebug(`→ ${ep.label}: POST ${ep.url} (model=${ep.model}, inputs=${n})`);
-    let resp: Response;
-    try {
-      resp = await fetchWithRetry(ep.url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${ep.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ model: ep.model, input }),
-      });
-    } catch (err) {
-      // Network-level failure (DNS/TLS/proxy/connection reset). undici masks the
-      // real reason as a bare "fetch failed" — surface error.cause so it's diagnosable.
-      const cause = (err as { cause?: { code?: string; message?: string } }).cause;
-      const detail = cause?.code
-        ? `${cause.code}${cause.message ? ` — ${cause.message}` : ""}`
-        : cause?.message ?? (err as Error).message;
-      throw new EndpointTransportError(`${ep.label} embeddings request failed (network): ${detail} [POST ${ep.url}]`);
-    }
 
-    if (!resp.ok) {
-      let msg = `${ep.label} embeddings API error: ${resp.status} ${resp.statusText}`;
+    for (let attempt = 0; ; attempt++) {
+      let resp: Response;
       try {
-        const body = await resp.json() as { error?: { message?: string } };
-        if (body.error?.message) msg += ` — ${body.error.message}`;
-      } catch {
-        // ignore JSON parse failure
+        resp = await fetchWithRetry(ep.url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${ep.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ model: ep.model, input }),
+          signal,
+        });
+      } catch (err) {
+        if ((err as Error).name === "AbortError") throw err;
+        // Network-level failure (DNS/TLS/proxy/connection reset). undici masks the
+        // real reason as a bare "fetch failed" — surface error.cause so it's diagnosable.
+        const cause = (err as { cause?: { code?: string; message?: string } }).cause;
+        const detail = cause?.code
+          ? `${cause.code}${cause.message ? ` — ${cause.message}` : ""}`
+          : cause?.message ?? (err as Error).message;
+        throw new EndpointTransportError(`${ep.label} embeddings request failed (network): ${detail} [POST ${ep.url}]`);
       }
-      // 5xx / 429 are transient (provider overload/outage) — allow failover.
-      // 4xx are terminal (auth/model/input) — failover can't fix them.
-      if (resp.status >= 500 || resp.status === 429) throw new EndpointTransportError(msg);
-      throw new Error(msg);
-    }
 
-    const body = await resp.json() as OpenRouterEmbeddingResponse & { error?: { message?: string } };
-    // Some models/batch-sizes return HTTP 200 with no `data` array (e.g. an error
-    // payload or a too-large input batch). Catch it here so callers get an
-    // actionable message instead of a downstream "data is not iterable".
-    if (!Array.isArray(body.data)) {
-      const n = Array.isArray(input) ? input.length : 1;
-      const hint = body.error?.message ?? JSON.stringify(body).slice(0, 200);
-      throw new Error(`${ep.label} embeddings: response missing 'data' array (model=${ep.model}, inputs=${n}): ${hint}`);
+      if (resp.status === 429) {
+        if (attempt < MAX_RATE_LIMIT_RETRIES) {
+          const delay = (parseRetryAfterMs(resp) ?? RATE_LIMIT_BASE_DELAY_MS * 2 ** attempt) + Math.random() * 250;
+          embedDebug(`429 from ${ep.label}, retry ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES} after ${Math.round(delay)}ms`);
+          await sleepWithAbort(delay, signal);
+          continue;
+        }
+      }
+
+      if (!resp.ok) {
+        let msg = `${ep.label} embeddings API error: ${resp.status} ${resp.statusText}`;
+        try {
+          const body = await resp.json() as { error?: { message?: string } };
+          if (body.error?.message) msg += ` — ${body.error.message}`;
+        } catch {
+          // ignore JSON parse failure
+        }
+        // 5xx / 429 are transient (provider overload/outage) — allow failover.
+        // 4xx are terminal (auth/model/input) — failover can't fix them.
+        if (resp.status >= 500 || resp.status === 429) throw new EndpointTransportError(msg);
+        throw new Error(msg);
+      }
+
+      const body = await resp.json() as OpenRouterEmbeddingResponse & { error?: { message?: string } };
+      // Some models/batch-sizes return HTTP 200 with no `data` array (e.g. an error
+      // payload or a too-large input batch). Catch it here so callers get an
+      // actionable message instead of a downstream "data is not iterable".
+      if (!Array.isArray(body.data)) {
+        const inputN = Array.isArray(input) ? input.length : 1;
+        const hint = body.error?.message ?? JSON.stringify(body).slice(0, 200);
+        throw new Error(`${ep.label} embeddings: response missing 'data' array (model=${ep.model}, inputs=${inputN}): ${hint}`);
+      }
+      return body;
     }
-    return body;
   }
 
-  private async callEmbeddings(input: string | string[]): Promise<OpenRouterEmbeddingResponse> {
+  private async callEmbeddings(input: string | string[], signal?: AbortSignal): Promise<OpenRouterEmbeddingResponse> {
     let lastTransportErr: unknown;
     for (let i = 0; i < this.endpoints.length; i++) {
       const ep = this.endpoints[i]!;
       try {
-        return await this.callEndpoint(ep, input);
+        return await this.callEndpoint(ep, input, signal);
       } catch (err) {
         if (err instanceof EndpointTransportError) {
           // Transport failure — try the next endpoint (if any).
@@ -263,28 +343,50 @@ export class OpenRouterEmbedding implements LLM {
     throw lastTransportErr ?? new Error("OpenRouterEmbedding: no embedding endpoints configured");
   }
 
-  async embed(text: string, _options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    const result = await this.callEmbeddings(text);
+  async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
+    const result = await this.callEmbeddings(text, options?.signal);
     const item = result.data[0];
     if (!item) return null;
     return { embedding: item.embedding, model: this.uri };
   }
 
-  async embedBatch(texts: string[], _options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+  async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
     if (texts.length === 0) return [];
 
-    // Split into chunks of batchSize and POST each chunk sequentially
-    const out: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
+    const slices: { offset: number; chunk: string[] }[] = [];
     for (let offset = 0; offset < texts.length; offset += this.batchSize) {
-      const chunk = texts.slice(offset, offset + this.batchSize);
-      const result = await this.callEmbeddings(chunk);
-      for (const item of result.data) {
-        const idx = offset + item.index;
-        if (idx >= 0 && idx < texts.length) {
-          out[idx] = { embedding: item.embedding, model: this.uri };
+      slices.push({ offset, chunk: texts.slice(offset, offset + this.batchSize) });
+    }
+
+    const out: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
+    let next = 0;
+    let aborted = false;
+
+    const worker = async () => {
+      while (!aborted) {
+        const i = next++;
+        if (i >= slices.length) break;
+        const slice = slices[i]!;
+        try {
+          const result = await this.callEmbeddings(slice.chunk, options?.signal);
+          for (const item of result.data) {
+            const idx = slice.offset + item.index;
+            if (idx >= 0 && idx < texts.length) {
+              out[idx] = { embedding: item.embedding, model: this.uri };
+            }
+          }
+        } catch (err) {
+          if ((err as Error).name === "AbortError") {
+            aborted = true;
+            break;
+          }
+          // Per-slice isolation: failed slice stays null; siblings keep results.
         }
       }
-    }
+    };
+
+    const workers = Array.from({ length: Math.min(this.concurrency, slices.length) }, () => worker());
+    await Promise.all(workers);
     return out;
   }
 

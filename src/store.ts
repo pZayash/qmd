@@ -36,6 +36,7 @@ import type {
   ContextMap,
 } from "./collections.js";
 import type { LinkRef } from "./links.js";
+import { slugifyAnchor } from "./links.js";
 
 // =============================================================================
 // Configuration
@@ -901,6 +902,7 @@ function initializeDatabase(db: Database): void {
       kind TEXT NOT NULL,
       raw_target TEXT NOT NULL,
       anchor TEXT,
+      src_anchor TEXT,
       PRIMARY KEY (hash, seq),
       FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE
     )
@@ -914,9 +916,38 @@ function initializeDatabase(db: Database): void {
       dst_doc_id INTEGER,
       kind TEXT NOT NULL,
       raw_target TEXT NOT NULL,
+      anchor TEXT,
+      src_anchor TEXT,
       FOREIGN KEY (src_doc_id) REFERENCES documents(id) ON DELETE CASCADE
     )
   `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS doc_anchors (
+      doc_id INTEGER NOT NULL,
+      collection TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      ord INTEGER NOT NULL,
+      PRIMARY KEY (doc_id, slug, ord)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_anchors_lookup ON doc_anchors(doc_id, slug)`);
+
+  const linkRefsInfo = db.prepare(`PRAGMA table_info(link_refs)`).all() as { name: string }[];
+  if (linkRefsInfo.length > 0 && !linkRefsInfo.some(col => col.name === "src_anchor")) {
+    db.exec(`ALTER TABLE link_refs ADD COLUMN src_anchor TEXT`);
+  }
+
+  const docEdgesInfo = db.prepare(`PRAGMA table_info(doc_edges)`).all() as { name: string }[];
+  if (docEdgesInfo.length > 0) {
+    if (!docEdgesInfo.some(col => col.name === "anchor")) {
+      db.exec(`ALTER TABLE doc_edges ADD COLUMN anchor TEXT`);
+    }
+    if (!docEdgesInfo.some(col => col.name === "src_anchor")) {
+      db.exec(`ALTER TABLE doc_edges ADD COLUMN src_anchor TEXT`);
+    }
+  }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_edges_dst ON doc_edges(dst_doc_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_edges_src ON doc_edges(src_doc_id, collection)`);
@@ -1491,10 +1522,17 @@ export async function reindexCollection(
           const { extractLinkRefs } = await import("./links.js");
           insertLinkRefs(db, hash, extractLinkRefs(content));
         }
+        if (!hasDocAnchorsForDoc(db, existing.id)) {
+          const { extractHeadingAnchors } = await import("./links.js");
+          deleteDocAnchors(db, existing.id);
+          insertDocAnchors(db, existing.id, collectionName, extractHeadingAnchors(content));
+        }
       } else {
         insertContent(db, hash, content, now);
-        const { extractLinkRefs } = await import("./links.js");
+        const { extractLinkRefs, extractHeadingAnchors } = await import("./links.js");
         insertLinkRefs(db, hash, extractLinkRefs(content));
+        deleteDocAnchors(db, existing.id);
+        insertDocAnchors(db, existing.id, collectionName, extractHeadingAnchors(content));
         const stat = statSync(filepath);
         updateDocument(db, existing.id, title, hash,
           stat ? new Date(stat.mtime).toISOString() : now);
@@ -1503,12 +1541,17 @@ export async function reindexCollection(
     } else {
       indexed++;
       insertContent(db, hash, content, now);
-      const { extractLinkRefs } = await import("./links.js");
+      const { extractLinkRefs, extractHeadingAnchors } = await import("./links.js");
       insertLinkRefs(db, hash, extractLinkRefs(content));
       const stat = statSync(filepath);
       insertDocument(db, collectionName, path, title, hash,
         stat ? new Date(stat.birthtime).toISOString() : now,
         stat ? new Date(stat.mtime).toISOString() : now);
+      const newDoc = findActiveDocument(db, collectionName, path);
+      if (newDoc) {
+        deleteDocAnchors(db, newDoc.id);
+        insertDocAnchors(db, newDoc.id, collectionName, extractHeadingAnchors(content));
+      }
     }
 
     processed++;
@@ -1768,7 +1811,7 @@ export async function generateEmbeddings(
       if (!vectorTableInitialized) {
         const firstChunk = batchChunks[0]!;
         const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
-        const firstResult = await session.embed(firstText, { model });
+        const firstResult = await session.embed(firstText, { model, signal: session.signal });
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
         }
@@ -1802,7 +1845,7 @@ export async function generateEmbeddings(
         const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
 
         try {
-          const embeddings = await session.embedBatch(texts, { model });
+          const embeddings = await session.embedBatch(texts, { model, signal: session.signal });
           for (let i = 0; i < chunkBatch.length; i++) {
             const chunk = chunkBatch[i]!;
             const embedding = embeddings[i];
@@ -1824,7 +1867,7 @@ export async function generateEmbeddings(
             for (const chunk of chunkBatch) {
               try {
                 const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
-                const result = await session.embed(text, { model });
+                const result = await session.embed(text, { model, signal: session.signal });
                 if (result) {
                   insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), embedModelUri, now);
                   chunksEmbedded++;
@@ -2375,6 +2418,8 @@ export type DocEdge = {
   dstDocId: number | null;
   dstPath: string | null;
   dstTitle: string | null;
+  anchor: string | null;
+  srcAnchor: string | null;
 };
 
 export type BacklinkEdge = {
@@ -2383,6 +2428,8 @@ export type BacklinkEdge = {
   srcDocId: number;
   srcPath: string;
   srcTitle: string;
+  anchor: string | null;
+  srcAnchor: string | null;
 };
 
 export type DanglingEdge = {
@@ -2391,10 +2438,28 @@ export type DanglingEdge = {
   srcDocId: number;
   srcPath: string;
   collection: string;
+  danglingKind: "doc" | "anchor";
+  anchor: string | null;
+  dstDocId: number | null;
 };
+
+/** SQL fragment: edge has resolved doc but unresolved anchor slug. */
+export const ANCHOR_DANGLING_PREDICATE = `
+  e.dst_doc_id IS NOT NULL
+  AND e.anchor IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM doc_anchors a
+    WHERE a.doc_id = e.dst_doc_id AND a.slug = e.anchor
+  )
+`;
 
 export function hasLinkRefsForHash(db: Database, hash: string): boolean {
   const row = db.prepare(`SELECT 1 AS ok FROM link_refs WHERE hash = ? LIMIT 1`).get(hash) as { ok: number } | undefined;
+  return row !== undefined;
+}
+
+export function hasDocAnchorsForDoc(db: Database, docId: number): boolean {
+  const row = db.prepare(`SELECT 1 AS ok FROM doc_anchors WHERE doc_id = ? LIMIT 1`).get(docId) as { ok: number } | undefined;
   return row !== undefined;
 }
 
@@ -2402,17 +2467,41 @@ export function deleteLinkRefsForHash(db: Database, hash: string): void {
   db.prepare(`DELETE FROM link_refs WHERE hash = ?`).run(hash);
 }
 
+export function deleteDocAnchors(db: Database, docId: number): void {
+  db.prepare(`DELETE FROM doc_anchors WHERE doc_id = ?`).run(docId);
+}
+
+export function insertDocAnchors(
+  db: Database,
+  docId: number,
+  collection: string,
+  anchors: { slug: string; kind: string; ord: number }[],
+): void {
+  deleteDocAnchors(db, docId);
+  if (anchors.length === 0) return;
+  const insert = db.prepare(`
+    INSERT INTO doc_anchors (doc_id, collection, slug, kind, ord)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const insertMany = db.transaction((items: typeof anchors) => {
+    for (const anchor of items) {
+      insert.run(docId, collection, anchor.slug, anchor.kind, anchor.ord);
+    }
+  });
+  insertMany(anchors);
+}
+
 export function insertLinkRefs(db: Database, hash: string, refs: LinkRef[]): void {
   deleteLinkRefsForHash(db, hash);
   if (refs.length === 0) return;
   const insert = db.prepare(`
-    INSERT INTO link_refs (hash, seq, kind, raw_target, anchor)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO link_refs (hash, seq, kind, raw_target, anchor, src_anchor)
+    VALUES (?, ?, ?, ?, ?, ?)
   `);
   const insertMany = db.transaction((items: LinkRef[]) => {
     for (let seq = 0; seq < items.length; seq++) {
       const ref = items[seq]!;
-      insert.run(hash, seq, ref.kind, ref.rawTarget, ref.anchor);
+      insert.run(hash, seq, ref.kind, ref.rawTarget, ref.anchor, ref.srcAnchor);
     }
   });
   insertMany(refs);
@@ -2421,6 +2510,7 @@ export function insertLinkRefs(db: Database, hash: string, refs: LinkRef[]): voi
 export type BackfillLinkRefsResult = {
   hashesProcessed: number;
   refsWritten: number;
+  anchorsWritten: number;
   collectionsResolved: string[];
 };
 
@@ -2433,39 +2523,50 @@ export async function backfillLinkRefs(
   collectionName?: string,
   options?: { force?: boolean; onProgress?: (done: number, total: number) => void },
 ): Promise<BackfillLinkRefsResult> {
-  const { extractLinkRefs } = await import("./links.js");
+  const { extractLinkRefs, extractHeadingAnchors } = await import("./links.js");
   const rows = (collectionName
     ? db.prepare(`
-        SELECT DISTINCT d.collection, d.hash, c.doc
+        SELECT DISTINCT d.id AS doc_id, d.collection, d.hash, c.doc
         FROM documents d
         JOIN content c ON d.hash = c.hash
         WHERE d.collection = ? AND d.active = 1
       `).all(collectionName)
     : db.prepare(`
-        SELECT DISTINCT d.collection, d.hash, c.doc
+        SELECT DISTINCT d.id AS doc_id, d.collection, d.hash, c.doc
         FROM documents d
         JOIN content c ON d.hash = c.hash
         WHERE d.active = 1
-      `).all()) as { collection: string; hash: string; doc: string }[];
+      `).all()) as { doc_id: number; collection: string; hash: string; doc: string }[];
 
   const collections = new Set<string>();
   let hashesProcessed = 0;
   let refsWritten = 0;
+  let anchorsWritten = 0;
   const total = rows.length;
 
   let scanned = 0;
   const backfill = db.transaction((batch: typeof rows) => {
     for (const row of batch) {
       scanned++;
-      if (!options?.force && hasLinkRefsForHash(db, row.hash)) {
+      const needsLinks = options?.force || !hasLinkRefsForHash(db, row.hash);
+      const needsAnchors = options?.force || !hasDocAnchorsForDoc(db, row.doc_id);
+      if (!needsLinks && !needsAnchors) {
         options?.onProgress?.(scanned, total);
         continue;
       }
-      const refs = extractLinkRefs(row.doc);
-      insertLinkRefs(db, row.hash, refs);
+      if (needsLinks) {
+        const refs = extractLinkRefs(row.doc);
+        insertLinkRefs(db, row.hash, refs);
+        refsWritten += refs.length;
+      }
+      if (needsAnchors) {
+        const anchors = extractHeadingAnchors(row.doc);
+        deleteDocAnchors(db, row.doc_id);
+        insertDocAnchors(db, row.doc_id, row.collection, anchors);
+        anchorsWritten += anchors.length;
+      }
       collections.add(row.collection);
       hashesProcessed++;
-      refsWritten += refs.length;
       options?.onProgress?.(scanned, total);
     }
   });
@@ -2491,22 +2592,34 @@ export async function backfillLinkRefs(
     }
   }
 
-  return { hashesProcessed, refsWritten, collectionsResolved };
+  return { hashesProcessed, refsWritten, anchorsWritten, collectionsResolved };
 }
 
 function getLinkRefsForHash(db: Database, hash: string): LinkRef[] {
   const rows = db.prepare(`
-    SELECT kind, raw_target, anchor
+    SELECT kind, raw_target, anchor, src_anchor
     FROM link_refs
     WHERE hash = ?
     ORDER BY seq
-  `).all(hash) as { kind: string; raw_target: string; anchor: string | null }[];
+  `).all(hash) as { kind: string; raw_target: string; anchor: string | null; src_anchor: string | null }[];
 
   return rows.map(row => ({
     kind: row.kind as LinkRef["kind"],
     rawTarget: row.raw_target,
     anchor: row.anchor,
+    srcAnchor: row.src_anchor,
   }));
+}
+
+function resolveAnchorSlug(db: Database, dstDocId: number, anchorText: string): string | null {
+  const slug = slugifyAnchor(anchorText);
+  const row = db.prepare(`
+    SELECT slug FROM doc_anchors
+    WHERE doc_id = ? AND slug = ?
+    ORDER BY ord
+    LIMIT 1
+  `).get(dstDocId, slug) as { slug: string } | undefined;
+  return row?.slug ?? null;
 }
 
 function pathBasename(path: string): string {
@@ -2579,8 +2692,8 @@ export function resolveDocEdges(db: Database, collectionName: string): void {
   }
 
   const insertEdge = db.prepare(`
-    INSERT INTO doc_edges (collection, src_doc_id, dst_doc_id, kind, raw_target)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO doc_edges (collection, src_doc_id, dst_doc_id, kind, raw_target, anchor, src_anchor)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
 
   const insertMany = db.transaction(() => {
@@ -2594,24 +2707,54 @@ export function resolveDocEdges(db: Database, collectionName: string): void {
         } else {
           dstDocId = resolveWikilinkTarget(ref.rawTarget, titleIndex, basenameIndex);
         }
-        insertEdge.run(collectionName, doc.id, dstDocId, ref.kind, ref.rawTarget);
+
+        let edgeAnchor: string | null = null;
+        if (ref.anchor != null) {
+          if (dstDocId != null) {
+            edgeAnchor = resolveAnchorSlug(db, dstDocId, ref.anchor) ?? slugifyAnchor(ref.anchor);
+          } else {
+            edgeAnchor = ref.anchor;
+          }
+        }
+
+        insertEdge.run(
+          collectionName,
+          doc.id,
+          dstDocId,
+          ref.kind,
+          ref.rawTarget,
+          edgeAnchor,
+          ref.srcAnchor,
+        );
       }
     }
   });
   insertMany();
 }
 
-export function getOutEdges(db: Database, docId: number): DocEdge[] {
-  const rows = db.prepare(`
-    SELECT e.kind, e.raw_target, e.dst_doc_id, d.path AS dst_path, d.title AS dst_title
-    FROM doc_edges e
-    LEFT JOIN documents d ON e.dst_doc_id = d.id
-    WHERE e.src_doc_id = ?
-    ORDER BY e.id
-  `).all(docId) as {
+export function getOutEdges(db: Database, docId: number, srcAnchorSlug?: string): DocEdge[] {
+  const rows = (srcAnchorSlug
+    ? db.prepare(`
+        SELECT e.kind, e.raw_target, e.dst_doc_id, e.anchor, e.src_anchor,
+               d.path AS dst_path, d.title AS dst_title
+        FROM doc_edges e
+        LEFT JOIN documents d ON e.dst_doc_id = d.id
+        WHERE e.src_doc_id = ? AND e.src_anchor = ?
+        ORDER BY e.id
+      `).all(docId, srcAnchorSlug)
+    : db.prepare(`
+        SELECT e.kind, e.raw_target, e.dst_doc_id, e.anchor, e.src_anchor,
+               d.path AS dst_path, d.title AS dst_title
+        FROM doc_edges e
+        LEFT JOIN documents d ON e.dst_doc_id = d.id
+        WHERE e.src_doc_id = ?
+        ORDER BY e.id
+      `).all(docId)) as {
     kind: string;
     raw_target: string;
     dst_doc_id: number | null;
+    anchor: string | null;
+    src_anchor: string | null;
     dst_path: string | null;
     dst_title: string | null;
   }[];
@@ -2622,19 +2765,33 @@ export function getOutEdges(db: Database, docId: number): DocEdge[] {
     dstDocId: row.dst_doc_id,
     dstPath: row.dst_path,
     dstTitle: row.dst_title,
+    anchor: row.anchor,
+    srcAnchor: row.src_anchor,
   }));
 }
 
-export function getBacklinks(db: Database, docId: number): BacklinkEdge[] {
-  const rows = db.prepare(`
-    SELECT e.kind, e.raw_target, e.src_doc_id, s.path AS src_path, s.title AS src_title
-    FROM doc_edges e
-    JOIN documents s ON e.src_doc_id = s.id
-    WHERE e.dst_doc_id = ?
-    ORDER BY e.id
-  `).all(docId) as {
+export function getBacklinks(db: Database, docId: number, anchorSlug?: string): BacklinkEdge[] {
+  const rows = (anchorSlug
+    ? db.prepare(`
+        SELECT e.kind, e.raw_target, e.anchor, e.src_anchor,
+               e.src_doc_id, s.path AS src_path, s.title AS src_title
+        FROM doc_edges e
+        JOIN documents s ON e.src_doc_id = s.id
+        WHERE e.dst_doc_id = ? AND e.anchor = ?
+        ORDER BY e.id
+      `).all(docId, anchorSlug)
+    : db.prepare(`
+        SELECT e.kind, e.raw_target, e.anchor, e.src_anchor,
+               e.src_doc_id, s.path AS src_path, s.title AS src_title
+        FROM doc_edges e
+        JOIN documents s ON e.src_doc_id = s.id
+        WHERE e.dst_doc_id = ?
+        ORDER BY e.id
+      `).all(docId)) as {
     kind: string;
     raw_target: string;
+    anchor: string | null;
+    src_anchor: string | null;
     src_doc_id: number;
     src_path: string;
     src_title: string;
@@ -2646,37 +2803,70 @@ export function getBacklinks(db: Database, docId: number): BacklinkEdge[] {
     srcDocId: row.src_doc_id,
     srcPath: row.src_path,
     srcTitle: row.src_title,
+    anchor: row.anchor,
+    srcAnchor: row.src_anchor,
   }));
 }
 
 export function getDanglingEdges(db: Database, collection?: string): DanglingEdge[] {
-  const rows = collection
-    ? db.prepare(`
-        SELECT e.kind, e.raw_target, e.src_doc_id, s.path AS src_path, e.collection
+  const docLevelSql = collection
+    ? `
+        SELECT e.kind, e.raw_target, e.src_doc_id, e.dst_doc_id, e.anchor,
+               s.path AS src_path, e.collection, 'doc' AS dangling_kind
         FROM doc_edges e
         JOIN documents s ON e.src_doc_id = s.id
         WHERE e.dst_doc_id IS NULL AND e.collection = ?
-        ORDER BY e.collection, s.path, e.id
-      `).all(collection) as {
-        kind: string;
-        raw_target: string;
-        src_doc_id: number;
-        src_path: string;
-        collection: string;
-      }[]
-    : db.prepare(`
-        SELECT e.kind, e.raw_target, e.src_doc_id, s.path AS src_path, e.collection
+      `
+    : `
+        SELECT e.kind, e.raw_target, e.src_doc_id, e.dst_doc_id, e.anchor,
+               s.path AS src_path, e.collection, 'doc' AS dangling_kind
         FROM doc_edges e
         JOIN documents s ON e.src_doc_id = s.id
         WHERE e.dst_doc_id IS NULL
-        ORDER BY e.collection, s.path, e.id
-      `).all() as {
-        kind: string;
-        raw_target: string;
-        src_doc_id: number;
-        src_path: string;
-        collection: string;
-      }[];
+      `;
+
+  const anchorLevelSql = collection
+    ? `
+        SELECT e.kind, e.raw_target, e.src_doc_id, e.dst_doc_id, e.anchor,
+               s.path AS src_path, e.collection, 'anchor' AS dangling_kind
+        FROM doc_edges e
+        JOIN documents s ON e.src_doc_id = s.id
+        WHERE e.collection = ? AND ${ANCHOR_DANGLING_PREDICATE}
+      `
+    : `
+        SELECT e.kind, e.raw_target, e.src_doc_id, e.dst_doc_id, e.anchor,
+               s.path AS src_path, e.collection, 'anchor' AS dangling_kind
+        FROM doc_edges e
+        JOIN documents s ON e.src_doc_id = s.id
+        WHERE ${ANCHOR_DANGLING_PREDICATE}
+      `;
+
+  const rows = (collection
+    ? db.prepare(`
+        SELECT * FROM (
+          ${docLevelSql}
+          UNION ALL
+          ${anchorLevelSql}
+        )
+        ORDER BY collection, src_path, kind
+      `).all(collection, collection)
+    : db.prepare(`
+        SELECT * FROM (
+          ${docLevelSql}
+          UNION ALL
+          ${anchorLevelSql}
+        )
+        ORDER BY collection, src_path, kind
+      `).all()) as {
+    kind: string;
+    raw_target: string;
+    src_doc_id: number;
+    dst_doc_id: number | null;
+    anchor: string | null;
+    src_path: string;
+    collection: string;
+    dangling_kind: "doc" | "anchor";
+  }[];
 
   return rows.map(row => ({
     kind: row.kind,
@@ -2684,6 +2874,9 @@ export function getDanglingEdges(db: Database, collection?: string): DanglingEdg
     srcDocId: row.src_doc_id,
     srcPath: row.src_path,
     collection: row.collection,
+    danglingKind: row.dangling_kind,
+    anchor: row.anchor,
+    dstDocId: row.dst_doc_id,
   }));
 }
 
