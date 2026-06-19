@@ -9,7 +9,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { openDatabase, loadSqliteVec } from "../src/db.js";
 import type { Database } from "../src/db.js";
-import { unlink, mkdtemp, rmdir, writeFile } from "node:fs/promises";
+import { unlink, mkdtemp, rmdir, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
@@ -49,6 +49,9 @@ import {
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
   generateEmbeddings,
+  reindexFiles,
+  resolveIndexFilePaths,
+  getHashesNeedingEmbedding,
   DEFAULT_EMBED_SESSION_MAX_DURATION_MS,
   resolveEmbedSessionMaxDurationMs,
   type Store,
@@ -3549,5 +3552,115 @@ describe("isDocid", () => {
 
   test("rejects paths that look like hex with extensions", () => {
     expect(isDocid("abc123.md")).toBe(false);
+  });
+});
+
+describe("partial index update", () => {
+  let testDir: string;
+  let collDir: string;
+  let dbPath: string;
+  let store: Store;
+
+  beforeEach(async () => {
+    testDir = await mkdtemp(join(tmpdir(), "qmd-partial-"));
+    collDir = join(testDir, "coll");
+    await mkdir(collDir, { recursive: true });
+    await writeFile(join(collDir, "a.md"), "# A\n");
+    await writeFile(join(collDir, "b.md"), "# B\n");
+    dbPath = join(testDir, "index.sqlite");
+    store = createStore(dbPath);
+    syncConfigToDb(store.db, {
+      collections: {
+        main: { path: collDir, pattern: "**/*.{md,bsl}" },
+      },
+    });
+  });
+
+  afterEach(async () => {
+    store.close();
+    await rmdir(testDir, { recursive: true });
+  });
+
+  test("resolveIndexFilePaths detects collection-relative paths", () => {
+    const { targets, warnings } = resolveIndexFilePaths(store.db, ["a.md"], collDir);
+    expect(warnings).toEqual([]);
+    expect(targets).toHaveLength(1);
+    expect(targets[0]!.collectionName).toBe("main");
+    expect(targets[0]!.relativePath).toBe("a.md");
+  });
+
+  test("reindexFiles updates one file without deactivating others", async () => {
+    await reindexFiles(store, (await resolveIndexFilePaths(store.db, ["a.md", "b.md"], collDir)).targets);
+    await writeFile(join(collDir, "a.md"), "# A updated\n");
+    await unlink(join(collDir, "b.md"));
+
+    const result = await reindexFiles(
+      store,
+      (await resolveIndexFilePaths(store.db, ["a.md"], collDir)).targets,
+    );
+
+    expect(result.updated).toBe(1);
+    expect(result.removed).toBe(0);
+
+    const activeB = store.db.prepare(
+      `SELECT active FROM documents WHERE collection = 'main' AND path = 'b.md'`,
+    ).get() as { active: number } | undefined;
+    expect(activeB?.active).toBe(1);
+  });
+
+  test("reindexFiles deactivates deleted listed paths", async () => {
+    const initial = await reindexFiles(
+      store,
+      (await resolveIndexFilePaths(store.db, ["a.md", "b.md"], collDir)).targets,
+    );
+    expect(initial.indexed).toBe(2);
+
+    await unlink(join(collDir, "b.md"));
+
+    const result = await reindexFiles(
+      store,
+      (await resolveIndexFilePaths(store.db, ["b.md"], collDir)).targets,
+    );
+
+    expect(result.removed).toBe(1);
+    expect(
+      (store.db.prepare(`SELECT COUNT(*) as c FROM documents WHERE active = 1`).get() as { c: number }).c,
+    ).toBe(1);
+  });
+
+  test("generateEmbeddings with paths embeds only listed documents", async () => {
+    await reindexFiles(store, (await resolveIndexFilePaths(store.db, ["a.md", "b.md"], collDir)).targets);
+
+    const fakeLlm = {
+      embedModelName: "fake-embed",
+      preferredEmbedBatchSize: 32,
+      async embed() {
+        return { embedding: [0.1, 0.2, 0.3], model: "fake-embed" };
+      },
+      async embedBatch(texts: string[]) {
+        return texts.map(() => ({ embedding: [0.1, 0.2, 0.3], model: "fake-embed" }));
+      },
+    };
+    setDefaultLlamaCpp({
+      async tokenize(text: string) {
+        return new Array(Math.max(1, Math.ceil(text.length / 16))).fill(1);
+      },
+    } as any);
+    store.llm = fakeLlm as any;
+
+    try {
+      expect(getHashesNeedingEmbedding(store.db)).toBe(2);
+
+      const result = await generateEmbeddings(store, {
+        paths: [{ collection: "main", path: "a.md" }],
+      });
+
+      expect(result.docsProcessed).toBe(1);
+      expect(getHashesNeedingEmbedding(store.db)).toBe(1);
+      expect(getHashesNeedingEmbedding(store.db, [{ collection: "main", path: "b.md" }])).toBe(1);
+    } finally {
+      store.llm = undefined;
+      setDefaultLlamaCpp(null);
+    }
   });
 });

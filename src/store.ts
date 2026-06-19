@@ -15,7 +15,7 @@ import { openDatabase, loadSqliteVec } from "./db.js";
 import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
-import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
+import { readFileSync, realpathSync, statSync, mkdirSync, existsSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import {
@@ -1419,7 +1419,7 @@ export type Store = {
   findOrMigrateLegacyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
-  deactivateDocument: (collectionName: string, path: string) => void;
+  deactivateDocument: (collectionName: string, path: string) => number;
   getActiveDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
@@ -1446,6 +1446,280 @@ export type ReindexResult = {
   removed: number;
   orphanedCleaned: number;
 };
+
+export type IndexDocumentResult = "indexed" | "updated" | "unchanged" | "skipped";
+
+export type DetectedCollectionPath = {
+  collectionName: string;
+  relativePath: string;
+  collectionPath: string;
+  globPattern: string;
+};
+
+export type ReindexFileTarget = {
+  collectionName: string;
+  relativePath: string;
+  collectionPath: string;
+  globPattern: string;
+};
+
+export type DocumentPathRef = {
+  collection: string;
+  path: string;
+};
+
+function pathMatchesCollectionGlob(relativePath: string, globPattern: string): boolean {
+  return picomatch(globPattern)(relativePath.replace(/\\/g, "/"));
+}
+
+/**
+ * Detect which collection contains a filesystem or virtual path.
+ * Longest collection-path prefix wins; falls back to path relative to each collection root.
+ */
+export function detectCollectionFromPath(
+  db: Database,
+  inputPath: string,
+  cwd: string = getPwd(),
+): DetectedCollectionPath | null {
+  const collections = getStoreCollections(db);
+  if (collections.length === 0) return null;
+
+  if (inputPath.startsWith("qmd://")) {
+    const parsed = parseVirtualPath(inputPath);
+    if (!parsed) return null;
+    const coll = getStoreCollection(db, parsed.collectionName);
+    if (!coll) return null;
+    return {
+      collectionName: coll.name,
+      relativePath: handelize(parsed.path),
+      collectionPath: coll.path,
+      globPattern: coll.pattern || DEFAULT_GLOB,
+    };
+  }
+
+  const normalizedInput = inputPath.replace(/\\/g, "/");
+  let absPath: string;
+  if (normalizedInput.startsWith("~/")) {
+    absPath = resolve(HOME, normalizedInput.slice(2));
+  } else if (normalizedInput.startsWith("/") || /^[A-Za-z]:\//.test(normalizedInput)) {
+    absPath = normalizedInput;
+  } else {
+    absPath = resolve(cwd, normalizedInput);
+  }
+  absPath = getRealPath(absPath);
+
+  let best: DetectedCollectionPath | null = null;
+
+  const tryMatch = (candidateAbs: string, coll: NamedCollection): DetectedCollectionPath | null => {
+    const collPath = coll.path.replace(/\\/g, "/");
+    const normCandidate = candidateAbs.replace(/\\/g, "/");
+    if (normCandidate !== collPath && !normCandidate.startsWith(collPath + "/")) {
+      return null;
+    }
+    const relativePath = normCandidate === collPath
+      ? ""
+      : normCandidate.slice(collPath.length + 1);
+    return {
+      collectionName: coll.name,
+      relativePath: relativePath ? handelize(relativePath) : "",
+      collectionPath: coll.path,
+      globPattern: coll.pattern || DEFAULT_GLOB,
+    };
+  };
+
+  for (const coll of collections) {
+    const match = tryMatch(absPath, coll);
+    if (match && (!best || coll.path.length > best.collectionPath.length)) {
+      best = match;
+    }
+  }
+  if (best) return best;
+
+  for (const coll of collections) {
+    const candidate = getRealPath(resolve(coll.path, normalizedInput));
+    const match = tryMatch(candidate, coll);
+    if (match && (!best || coll.path.length > best.collectionPath.length)) {
+      best = match;
+    }
+  }
+
+  return best;
+}
+
+/**
+ * Resolve CLI/SDK file paths to collection-relative reindex targets.
+ * Existing files must match the collection glob; deleted paths are kept for deactivation.
+ */
+export function resolveIndexFilePaths(
+  db: Database,
+  filePaths: string[],
+  cwd?: string,
+): { targets: ReindexFileTarget[]; warnings: string[] } {
+  const warnings: string[] = [];
+  const targets: ReindexFileTarget[] = [];
+  const seen = new Set<string>();
+  const cwdPath = cwd ?? getPwd();
+
+  for (const input of filePaths) {
+    const detected = detectCollectionFromPath(db, input, cwdPath);
+    if (!detected) {
+      warnings.push(`Path not in any collection: ${input}`);
+      continue;
+    }
+    if (!detected.relativePath) {
+      warnings.push(`Path is a collection root, not a file: ${input}`);
+      continue;
+    }
+
+    const key = `${detected.collectionName}\0${detected.relativePath}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const filepath = resolve(detected.collectionPath, detected.relativePath);
+    const fileExists = existsSync(filepath);
+    if (fileExists && !pathMatchesCollectionGlob(detected.relativePath, detected.globPattern)) {
+      warnings.push(`Path does not match collection glob (${detected.globPattern}): ${input}`);
+      continue;
+    }
+
+    targets.push({
+      collectionName: detected.collectionName,
+      relativePath: detected.relativePath,
+      collectionPath: detected.collectionPath,
+      globPattern: detected.globPattern,
+    });
+  }
+
+  return { targets, warnings };
+}
+
+/**
+ * Index or update a single document at a collection-relative path.
+ * Skips missing/unreadable/empty files without deactivating.
+ */
+export async function indexDocumentAtPath(
+  db: Database,
+  collectionPath: string,
+  collectionName: string,
+  relativeFile: string,
+  now?: string,
+): Promise<IndexDocumentResult> {
+  const timestamp = now ?? new Date().toISOString();
+  const filepath = getRealPath(resolve(collectionPath, relativeFile));
+  const path = handelize(relativeFile);
+
+  let content: string;
+  try {
+    content = readFileSync(filepath, "utf-8");
+  } catch {
+    return "skipped";
+  }
+
+  if (!content.trim()) {
+    return "skipped";
+  }
+
+  const hash = await hashContent(content);
+  const title = extractTitle(content, relativeFile);
+  const existing = findOrMigrateLegacyDocument(db, collectionName, path);
+
+  if (existing) {
+    if (existing.hash === hash) {
+      if (existing.title !== title) {
+        updateDocumentTitle(db, existing.id, title, timestamp);
+      } else {
+        if (!hasLinkRefsForHash(db, hash)) {
+          const { extractLinkRefs } = await import("./links.js");
+          insertLinkRefs(db, hash, extractLinkRefs(content));
+        }
+        if (!hasDocAnchorsForDoc(db, existing.id)) {
+          const { extractHeadingAnchors } = await import("./links.js");
+          deleteDocAnchors(db, existing.id);
+          insertDocAnchors(db, existing.id, collectionName, extractHeadingAnchors(content));
+        }
+        return existing.title !== title ? "updated" : "unchanged";
+      }
+      if (!hasLinkRefsForHash(db, hash)) {
+        const { extractLinkRefs } = await import("./links.js");
+        insertLinkRefs(db, hash, extractLinkRefs(content));
+      }
+      if (!hasDocAnchorsForDoc(db, existing.id)) {
+        const { extractHeadingAnchors } = await import("./links.js");
+        deleteDocAnchors(db, existing.id);
+        insertDocAnchors(db, existing.id, collectionName, extractHeadingAnchors(content));
+      }
+      return "updated";
+    }
+    insertContent(db, hash, content, timestamp);
+    const { extractLinkRefs, extractHeadingAnchors } = await import("./links.js");
+    insertLinkRefs(db, hash, extractLinkRefs(content));
+    deleteDocAnchors(db, existing.id);
+    insertDocAnchors(db, existing.id, collectionName, extractHeadingAnchors(content));
+    const stat = statSync(filepath);
+    updateDocument(db, existing.id, title, hash,
+      stat ? new Date(stat.mtime).toISOString() : timestamp);
+    return "updated";
+  }
+
+  insertContent(db, hash, content, timestamp);
+  const { extractLinkRefs, extractHeadingAnchors } = await import("./links.js");
+  insertLinkRefs(db, hash, extractLinkRefs(content));
+  const stat = statSync(filepath);
+  insertDocument(db, collectionName, path, title, hash,
+    stat ? new Date(stat.birthtime).toISOString() : timestamp,
+    stat ? new Date(stat.mtime).toISOString() : timestamp);
+  const newDoc = findActiveDocument(db, collectionName, path);
+  if (newDoc) {
+    deleteDocAnchors(db, newDoc.id);
+    insertDocAnchors(db, newDoc.id, collectionName, extractHeadingAnchors(content));
+  }
+  return "indexed";
+}
+
+/**
+ * Re-index only the given paths within their collections.
+ * Does not deactivate documents outside the provided list.
+ */
+export async function reindexFiles(
+  store: Store,
+  targets: ReindexFileTarget[],
+  options?: {
+    onProgress?: (info: ReindexProgress) => void;
+  },
+): Promise<ReindexResult> {
+  const db = store.db;
+  const now = new Date().toISOString();
+  const total = targets.length;
+  let indexed = 0, updated = 0, unchanged = 0, removed = 0, processed = 0;
+
+  for (const target of targets) {
+    const filepath = resolve(target.collectionPath, target.relativePath);
+    const fileExists = existsSync(filepath);
+
+    if (fileExists) {
+      const result = await indexDocumentAtPath(
+        db,
+        target.collectionPath,
+        target.collectionName,
+        target.relativePath,
+        now,
+      );
+      switch (result) {
+        case "indexed": indexed++; break;
+        case "updated": updated++; break;
+        case "unchanged": unchanged++; break;
+      }
+    } else {
+      removed += deactivateDocument(db, target.collectionName, target.relativePath);
+    }
+
+    processed++;
+    options?.onProgress?.({ file: target.relativePath, current: processed, total });
+  }
+
+  const orphanedCleaned = cleanupOrphanedContent(db);
+  return { indexed, updated, unchanged, removed, orphanedCleaned };
+}
 
 /**
  * Re-index a single collection by scanning the filesystem and updating the database.
@@ -1487,71 +1761,14 @@ export async function reindexCollection(
   const seenPaths = new Set<string>();
 
   for (const relativeFile of files) {
-    const filepath = getRealPath(resolve(collectionPath, relativeFile));
     const path = handelize(relativeFile);
     seenPaths.add(path);
 
-    let content: string;
-    try {
-      content = readFileSync(filepath, "utf-8");
-    } catch {
-      processed++;
-      options?.onProgress?.({ file: relativeFile, current: processed, total });
-      continue;
-    }
-
-    if (!content.trim()) {
-      processed++;
-      continue;
-    }
-
-    const hash = await hashContent(content);
-    const title = extractTitle(content, relativeFile);
-
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path);
-
-    if (existing) {
-      if (existing.hash === hash) {
-        if (existing.title !== title) {
-          updateDocumentTitle(db, existing.id, title, now);
-          updated++;
-        } else {
-          unchanged++;
-        }
-        if (!hasLinkRefsForHash(db, hash)) {
-          const { extractLinkRefs } = await import("./links.js");
-          insertLinkRefs(db, hash, extractLinkRefs(content));
-        }
-        if (!hasDocAnchorsForDoc(db, existing.id)) {
-          const { extractHeadingAnchors } = await import("./links.js");
-          deleteDocAnchors(db, existing.id);
-          insertDocAnchors(db, existing.id, collectionName, extractHeadingAnchors(content));
-        }
-      } else {
-        insertContent(db, hash, content, now);
-        const { extractLinkRefs, extractHeadingAnchors } = await import("./links.js");
-        insertLinkRefs(db, hash, extractLinkRefs(content));
-        deleteDocAnchors(db, existing.id);
-        insertDocAnchors(db, existing.id, collectionName, extractHeadingAnchors(content));
-        const stat = statSync(filepath);
-        updateDocument(db, existing.id, title, hash,
-          stat ? new Date(stat.mtime).toISOString() : now);
-        updated++;
-      }
-    } else {
-      indexed++;
-      insertContent(db, hash, content, now);
-      const { extractLinkRefs, extractHeadingAnchors } = await import("./links.js");
-      insertLinkRefs(db, hash, extractLinkRefs(content));
-      const stat = statSync(filepath);
-      insertDocument(db, collectionName, path, title, hash,
-        stat ? new Date(stat.birthtime).toISOString() : now,
-        stat ? new Date(stat.mtime).toISOString() : now);
-      const newDoc = findActiveDocument(db, collectionName, path);
-      if (newDoc) {
-        deleteDocAnchors(db, newDoc.id);
-        insertDocAnchors(db, newDoc.id, collectionName, extractHeadingAnchors(content));
-      }
+    const result = await indexDocumentAtPath(db, collectionPath, collectionName, relativeFile, now);
+    switch (result) {
+      case "indexed": indexed++; break;
+      case "updated": updated++; break;
+      case "unchanged": unchanged++; break;
     }
 
     processed++;
@@ -1597,6 +1814,8 @@ export type EmbedOptions = {
   maxBatchBytes?: number;
   sessionMaxDurationMs?: number;
   chunkStrategy?: ChunkStrategy;
+  /** Restrict embedding to specific collection paths (resolved document refs) */
+  paths?: DocumentPathRef[];
   onProgress?: (info: EmbedProgress) => void;
 };
 
@@ -1660,16 +1879,32 @@ export function resolveEmbedSessionMaxDurationMs(envValue = process.env.QMD_EMBE
   return parsed * 1000;
 }
 
-function getPendingEmbeddingDocs(db: Database): PendingEmbeddingDoc[] {
+function getPendingEmbeddingDocs(db: Database, pathFilter?: DocumentPathRef[]): PendingEmbeddingDoc[] {
+  if (!pathFilter || pathFilter.length === 0) {
+    return db.prepare(`
+      SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
+      FROM documents d
+      JOIN content c ON d.hash = c.hash
+      LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+      WHERE d.active = 1 AND v.hash IS NULL
+      GROUP BY d.hash
+      ORDER BY MIN(d.path)
+    `).all() as PendingEmbeddingDoc[];
+  }
+
+  const conditions = pathFilter.map(() => "(d.collection = ? AND d.path = ?)").join(" OR ");
+  const params = pathFilter.flatMap(ref => [ref.collection, ref.path]);
+
   return db.prepare(`
     SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
     FROM documents d
     JOIN content c ON d.hash = c.hash
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
     WHERE d.active = 1 AND v.hash IS NULL
+      AND (${conditions})
     GROUP BY d.hash
     ORDER BY MIN(d.path)
-  `).all() as PendingEmbeddingDoc[];
+  `).all(...params) as PendingEmbeddingDoc[];
 }
 
 function buildEmbeddingBatches(
@@ -1736,10 +1971,14 @@ export async function generateEmbeddings(
   const encoder = new TextEncoder();
 
   if (options?.force) {
-    clearAllEmbeddings(db);
+    if (options.paths && options.paths.length > 0) {
+      clearEmbeddingsForDocuments(db, options.paths);
+    } else {
+      clearAllEmbeddings(db);
+    }
   }
 
-  const docsToEmbed = getPendingEmbeddingDocs(db);
+  const docsToEmbed = getPendingEmbeddingDocs(db, options?.paths);
 
   if (docsToEmbed.length === 0) {
     return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
@@ -2190,13 +2429,26 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database): number {
+export function getHashesNeedingEmbedding(db: Database, pathFilter?: DocumentPathRef[]): number {
+  if (!pathFilter || pathFilter.length === 0) {
+    const result = db.prepare(`
+      SELECT COUNT(DISTINCT d.hash) as count
+      FROM documents d
+      LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+      WHERE d.active = 1 AND v.hash IS NULL
+    `).get() as { count: number };
+    return result.count;
+  }
+
+  const conditions = pathFilter.map(() => "(d.collection = ? AND d.path = ?)").join(" OR ");
+  const params = pathFilter.flatMap(ref => [ref.collection, ref.path]);
   const result = db.prepare(`
     SELECT COUNT(DISTINCT d.hash) as count
     FROM documents d
     LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
     WHERE d.active = 1 AND v.hash IS NULL
-  `).get() as { count: number };
+      AND (${conditions})
+  `).get(...params) as { count: number };
   return result.count;
 }
 
@@ -3002,9 +3254,10 @@ export function updateDocument(
 /**
  * Deactivate a document (mark as inactive but don't delete).
  */
-export function deactivateDocument(db: Database, collectionName: string, path: string): void {
-  db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = ? AND active = 1`)
+export function deactivateDocument(db: Database, collectionName: string, path: string): number {
+  const result = db.prepare(`UPDATE documents SET active = 0 WHERE collection = ? AND path = ? AND active = 1`)
     .run(collectionName, path);
+  return result.changes;
 }
 
 /**
@@ -4170,6 +4423,28 @@ export function clearAllEmbeddings(db: Database): void {
   db.exec(`DROP TABLE IF EXISTS vectors_vec`);
   db.exec(`DROP TABLE IF EXISTS vectors_bit`);
   db.exec(`DROP TABLE IF EXISTS vectors_rescore`);
+}
+
+/**
+ * Clear embeddings for active documents at the given collection paths.
+ */
+export function clearEmbeddingsForDocuments(db: Database, paths: DocumentPathRef[]): void {
+  if (paths.length === 0) return;
+
+  const conditions = paths.map(() => "(collection = ? AND path = ?)").join(" OR ");
+  const params = paths.flatMap(ref => [ref.collection, ref.path]);
+  const hashes = db.prepare(`
+    SELECT DISTINCT hash FROM documents
+    WHERE active = 1 AND (${conditions})
+  `).all(...params) as { hash: string }[];
+
+  const deleteContentVectors = db.prepare(`DELETE FROM content_vectors WHERE hash = ?`);
+  const deleteVec = db.prepare(`DELETE FROM vectors_vec WHERE hash_seq LIKE ?`);
+
+  for (const { hash } of hashes) {
+    deleteContentVectors.run(hash);
+    deleteVec.run(`${hash}_%`);
+  }
 }
 
 /**

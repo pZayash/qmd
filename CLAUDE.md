@@ -29,6 +29,9 @@ qmd links <doc> [--dangling]      # Out-links, backlinks, broken links (-c colle
 qmd links --backfill [-c name]    # Extract links from indexed content (post-upgrade backfill)
 qmd status                        # Show index status and collections
 qmd update [--pull]               # Re-index all collections (--pull: git pull first)
+qmd update --files <path>…        # Re-index only listed paths (collection-relative or fs)
+qmd update --files <path>… --strict  # Exit 1 on paths outside collections / glob mismatch
+qmd embed [--files <path>…]       # Embed pending hashes (all, or only listed paths)
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
 qmd embed --requantize            # Rebuild quantized vector tables from existing floats (local, no re-embed)
 qmd query <query>                 # Search with query expansion + reranking (recommended)

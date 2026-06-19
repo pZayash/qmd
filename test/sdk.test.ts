@@ -923,6 +923,82 @@ describe("update", () => {
 
     await store.close();
   });
+
+  test("update with files indexes only listed paths", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    await store.update();
+    await writeFile(join(docsDir, "auth.md"), "# Authentication\n\nUpdated JWT flow.\n");
+
+    const result = await store.update({ files: ["auth.md"] });
+
+    expect(result.collections).toBe(0);
+    expect(result.indexed).toBe(0);
+    expect(result.updated).toBe(1);
+    expect(result.removed).toBe(0);
+
+    const results = await store.searchLex("Updated JWT");
+    expect(results.length).toBeGreaterThan(0);
+
+    await store.close();
+  });
+
+  test("update with files deactivates deleted paths only", async () => {
+    const tempDir = join(testDir, `partial-delete-${Date.now()}`);
+    const tempDocs = join(tempDir, "docs");
+    await mkdir(tempDocs, { recursive: true });
+    const extraFile = join(tempDocs, "extra.md");
+    await writeFile(join(tempDocs, "readme.md"), "# Readme\n");
+    await writeFile(extraFile, "# Extra\n");
+
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: tempDocs, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    await store.update();
+    await rm(extraFile);
+
+    const result = await store.update({ files: ["extra.md"] });
+    expect(result.removed).toBe(1);
+
+    const getExtra = await store.get("qmd://docs/extra.md");
+    expect("error" in getExtra).toBe(true);
+
+    const getReadme = await store.get("qmd://docs/readme.md");
+    expect("error" in getReadme).toBe(false);
+
+    await store.close();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("update with files strict throws on unknown path", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    await expect(
+      store.update({ files: ["../outside.md"], strict: true }),
+    ).rejects.toThrow(/not in any collection/i);
+
+    await store.close();
+  });
 });
 
 describe("embed", () => {

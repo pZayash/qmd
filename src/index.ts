@@ -26,6 +26,8 @@ import {
   DEFAULT_EMBED_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   reindexCollection,
+  reindexFiles,
+  resolveIndexFilePaths,
   generateEmbeddings,
   listCollections as storeListCollections,
   syncConfigToDb,
@@ -290,6 +292,10 @@ export interface QMDStore {
   /** Re-index collections by scanning the filesystem */
   update(options?: {
     collections?: string[];
+    /** Re-index only these paths (collection-relative or filesystem paths) */
+    files?: string[];
+    /** Exit with error when a file path cannot be resolved (SDK: throws) */
+    strict?: boolean;
     onProgress?: (info: UpdateProgress) => void;
   }): Promise<UpdateResult>;
 
@@ -300,6 +306,8 @@ export interface QMDStore {
     maxDocsPerBatch?: number;
     maxBatchBytes?: number;
     chunkStrategy?: ChunkStrategy;
+    /** Embed only hashes for these paths (collection-relative or filesystem paths) */
+    files?: string[];
     onProgress?: (info: EmbedProgress) => void;
   }): Promise<EmbedResult>;
 
@@ -512,11 +520,39 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     // Indexing — reads collections from SQLite
     update: async (updateOpts) => {
       const collections = getStoreCollections(db);
+      internal.clearCache();
+
+      if (updateOpts?.files && updateOpts.files.length > 0) {
+        const { targets, warnings } = resolveIndexFilePaths(db, updateOpts.files);
+        if (warnings.length > 0 && updateOpts.strict) {
+          throw new Error(warnings.join("\n"));
+        }
+
+        const result = await reindexFiles(internal, targets, {
+          onProgress: updateOpts.onProgress
+            ? (info) => {
+                const target = targets[info.current - 1];
+                updateOpts.onProgress!({
+                  collection: target?.collectionName ?? "",
+                  ...info,
+                });
+              }
+            : undefined,
+        });
+
+        return {
+          collections: 0,
+          indexed: result.indexed,
+          updated: result.updated,
+          unchanged: result.unchanged,
+          removed: result.removed,
+          needsEmbedding: internal.getHashesNeedingEmbedding(),
+        };
+      }
+
       const filtered = updateOpts?.collections
         ? collections.filter(c => updateOpts.collections!.includes(c.name))
         : collections;
-
-      internal.clearCache();
 
       let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0;
 
@@ -544,12 +580,19 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
 
     embed: async (embedOpts) => {
+      let paths: { collection: string; path: string }[] | undefined;
+      if (embedOpts?.files && embedOpts.files.length > 0) {
+        const { targets } = resolveIndexFilePaths(db, embedOpts.files);
+        paths = targets.map(t => ({ collection: t.collectionName, path: t.relativePath }));
+      }
+
       return generateEmbeddings(internal, {
         force: embedOpts?.force,
         model: embedOpts?.model,
         maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
         maxBatchBytes: embedOpts?.maxBatchBytes,
         chunkStrategy: embedOpts?.chunkStrategy,
+        paths,
         onProgress: embedOpts?.onProgress,
       });
     },

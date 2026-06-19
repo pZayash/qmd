@@ -816,8 +816,15 @@ qmd status
 # Re-index all collections
 qmd update
 
+# Re-index only changed files (post-commit hooks, large collections)
+qmd update --files path/one.bsl path/two.md
+qmd update --files path/one.bsl --strict   # fail on unknown paths
+
 # Re-index with git pull first (for remote repos)
 qmd update --pull
+
+# Embed only hashes for listed paths (after partial update)
+qmd embed --files path/one.bsl
 
 # Get document by filepath (with fuzzy matching suggestions)
 qmd get notes/meeting.md

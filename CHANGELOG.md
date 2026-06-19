@@ -51,6 +51,11 @@
 
 ### Changes
 
+- `qmd update --files <path>…` and `qmd embed --files <path>…`: partial index/embed for
+  specific collection-relative or filesystem paths. Deleted listed paths are deactivated;
+  unlisted documents are untouched (unlike full `qmd update`). Unknown paths log a warning
+  (exit 0); `--strict` exits 1. SDK: `update({ files })` and `embed({ files })`.
+
 - Env loading: unify into a precedence cascade — shell env > `<cwd>/.env`
   (project-local) > `~/.config/qmd/.env` (global). Previously only the global
   file was read for general vars (a project `.env` was ignored), while

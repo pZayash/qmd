@@ -82,6 +82,9 @@ import {
   createStore,
   getDefaultDbPath,
   reindexCollection,
+  reindexFiles,
+  resolveIndexFilePaths,
+  detectCollectionFromPath,
   generateEmbeddings,
   resolveEmbedSessionMaxDurationMs,
   syncConfigToDb,
@@ -599,6 +602,67 @@ async function showStatus(): Promise<void> {
   closeDb();
 }
 
+function parseIndexFilesFromArgv(argv: string[]): string[] {
+  const files: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--files") {
+      while (i + 1 < argv.length && !argv[i + 1]!.startsWith("-")) {
+        files.push(argv[++i]!);
+      }
+    }
+  }
+  return files;
+}
+
+async function updateFiles(filePaths: string[], strict: boolean): Promise<void> {
+  const db = getDb();
+  const storeInstance = getStore();
+  clearCache(db);
+
+  const { targets, warnings } = resolveIndexFilePaths(db, filePaths);
+  for (const warning of warnings) {
+    console.log(`${c.yellow}⚠ ${warning}${c.reset}`);
+  }
+  if (warnings.length > 0 && strict) {
+    closeDb();
+    process.exit(1);
+  }
+  if (targets.length === 0) {
+    console.log(`${c.dim}No files to update.${c.reset}`);
+    closeDb();
+    return;
+  }
+
+  console.log(`${c.bold}Updating ${targets.length} file(s)...${c.reset}\n`);
+  const startTime = Date.now();
+  progress.indeterminate();
+
+  const result = await reindexFiles(storeInstance, targets, {
+    onProgress: (info) => {
+      progress.set((info.current / info.total) * 100);
+      const elapsed = (Date.now() - startTime) / 1000;
+      const rate = info.current / elapsed;
+      const remaining = (info.total - info.current) / rate;
+      const eta = info.current > 2 ? ` ETA: ${formatETA(remaining)}` : "";
+      if (isTTY) process.stderr.write(`\rIndexing: ${info.current}/${info.total}${eta}        `);
+    },
+  });
+
+  progress.clear();
+  console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+  if (result.orphanedCleaned > 0) {
+    console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
+  }
+
+  const needsEmbedding = getHashesNeedingEmbedding(db);
+  closeDb();
+
+  console.log(`\n${c.green}✓ File update complete.${c.reset}`);
+  if (needsEmbedding > 0) {
+    console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+  }
+}
+
 async function updateCollections(): Promise<void> {
   const db = getDb();
   const storeInstance = getStore();
@@ -690,42 +754,6 @@ async function updateCollections(): Promise<void> {
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
-}
-
-/**
- * Detect which collection (if any) contains the given filesystem path.
- * Returns { collectionId, collectionName, relativePath } or null if not in any collection.
- */
-function detectCollectionFromPath(db: Database, fsPath: string): { collectionName: string; relativePath: string } | null {
-  const realPath = getRealPath(fsPath);
-
-  // Find collections that this path is under from YAML
-  const allCollections = yamlListCollections();
-
-  // Find longest matching path
-  let bestMatch: { name: string; path: string } | null = null;
-  for (const coll of allCollections) {
-    if (realPath.startsWith(coll.path + '/') || realPath === coll.path) {
-      if (!bestMatch || coll.path.length > bestMatch.path.length) {
-        bestMatch = { name: coll.name, path: coll.path };
-      }
-    }
-  }
-
-  if (!bestMatch) return null;
-
-  // Calculate relative path
-  let relativePath = realPath;
-  if (relativePath.startsWith(bestMatch.path + '/')) {
-    relativePath = relativePath.slice(bestMatch.path.length + 1);
-  } else if (relativePath === bestMatch.path) {
-    relativePath = '';
-  }
-
-  return {
-    collectionName: bestMatch.name,
-    relativePath
-  };
 }
 
 async function contextAdd(pathArg: string | undefined, contextText: string): Promise<void> {
@@ -1783,18 +1811,33 @@ function resolveEmbedTimeoutEnvValue(): { value: string | undefined; source: "en
 
 async function vectorIndex(
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; filePaths?: string[] },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
   const model = getDefaultLlamaCpp().embedModelName;
 
+  let embedPaths: { collection: string; path: string }[] | undefined;
+  if (batchOptions?.filePaths && batchOptions.filePaths.length > 0) {
+    const { targets, warnings } = resolveIndexFilePaths(db, batchOptions.filePaths);
+    for (const warning of warnings) {
+      console.log(`${c.yellow}⚠ ${warning}${c.reset}`);
+    }
+    embedPaths = targets.map(t => ({ collection: t.collectionName, path: t.relativePath }));
+  }
+
   if (force) {
-    console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
+    if (embedPaths && embedPaths.length > 0) {
+      console.log(`${c.yellow}Force re-indexing: clearing vectors for ${embedPaths.length} file(s)...${c.reset}`);
+    } else {
+      console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
+    }
   }
 
   // Check if there's work to do before starting
-  const hashesToEmbed = getHashesNeedingEmbedding(db);
+  const hashesToEmbed = embedPaths
+    ? getHashesNeedingEmbedding(db, embedPaths)
+    : getHashesNeedingEmbedding(db);
   if (hashesToEmbed === 0 && !force) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
     closeDb();
@@ -1835,6 +1878,7 @@ async function vectorIndex(
     maxBatchBytes: batchOptions?.maxBatchBytes,
     sessionMaxDurationMs: embedSessionMaxDurationMs,
     chunkStrategy: batchOptions?.chunkStrategy,
+    paths: embedPaths,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
       const percent = (info.bytesProcessed / info.totalBytes) * 100;
@@ -2688,6 +2732,7 @@ function parseCLI() {
       "max-batch-mb": { type: "string" },
       // Update options
       pull: { type: "boolean" },  // git pull before update
+      strict: { type: "boolean" },  // exit 1 on unresolved --files paths (update)
       refresh: { type: "boolean" },
       // Get options
       l: { type: "string" },  // max lines
@@ -3085,8 +3130,8 @@ function showHelp(): void {
   console.log("");
   console.log("Maintenance:");
   console.log("  qmd status                    - View index + collection health");
-  console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
-  console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
+  console.log("  qmd update [--files <path>...] [--strict] - Re-index collections or specific files");
+  console.log("  qmd embed [-f] [--files <path>...]      - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
@@ -3593,9 +3638,15 @@ if (isMain) {
       await showStatus();
       break;
 
-    case "update":
-      await updateCollections();
+    case "update": {
+      const indexFiles = parseIndexFilesFromArgv(process.argv.slice(2));
+      if (indexFiles.length > 0) {
+        await updateFiles(indexFiles, !!cli.values.strict);
+      } else {
+        await updateCollections();
+      }
       break;
+    }
 
     case "embed":
       try {
@@ -3603,6 +3654,7 @@ if (isMain) {
           await requantizeVectors();
           break;
         }
+        const embedFiles = parseIndexFilesFromArgv(process.argv.slice(2));
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
@@ -3610,6 +3662,7 @@ if (isMain) {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
+          filePaths: embedFiles.length > 0 ? embedFiles : undefined,
         });
       } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));
