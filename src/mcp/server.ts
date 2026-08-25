@@ -95,6 +95,15 @@ function encodeQmdPath(path: string): string {
   return path.split('/').map(segment => encodeURIComponent(segment)).join('/');
 }
 
+/** CLI `--path` parity: `\\` → `/`, strip one leading `/`, keep trailing `/`. */
+function normalizePathPrefixes(raw?: string[]): string[] | undefined {
+  if (!raw?.length) return undefined;
+  const out = raw
+    .map(p => p.replace(/\\/g, "/").replace(/^\//, ""))
+    .filter(p => p.length > 0);
+  return out.length > 0 ? out : undefined;
+}
+
 /**
  * Format search results as human-readable text summary
  */
@@ -322,7 +331,11 @@ Intent-aware lex (C++ performance, not sports):
   { "type": "lex", "query": "\\"C++ performance\\" optimization -sports -athlete" },
   { "type": "vec", "query": "how to optimize C++ program performance" }
 ]
-\`\`\``,
+\`\`\`
+
+## Agent drill
+
+After a \`kind: dir\` hit: \`get\` the dir-node L0, then \`query\` again with \`path: ["<dirpath>/"]\` (trailing slash) and typically \`kind: "file"\`. Same tools — no \`drill\` / \`ls\` command. Trailing \`/\` is the caller's job so sibling names are not prefix-matched.`,
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         searches: z.array(subSearchSchema).min(1).max(10).describe(
@@ -334,6 +347,9 @@ Intent-aware lex (C++ performance, not sports):
           "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
         ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
+        path: z.array(z.string()).optional().describe(
+          "Restrict to collection-relative path prefixes (OR). Same as CLI --path: leading / is stripped, trailing / is kept. For agent drill after a dir hit use [\"dirpath/\"]."
+        ),
         kind: z.enum(["file", "dir"]).optional().describe(
           "Restrict hits to files or directory L0 nodes. Omit to mix both. QMD_DIR_NODES=0 hides dirs even when kind=dir."
         ),
@@ -345,7 +361,7 @@ Intent-aware lex (C++ performance, not sports):
         ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, kind, intent, rerank }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections, path, kind, intent, rerank }) => {
       // Map to internal format
       const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
@@ -358,6 +374,7 @@ Intent-aware lex (C++ performance, not sports):
       const results = await store.search({
         queries,
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+        pathPrefixes: normalizePathPrefixes(path),
         limit,
         minScore,
         rerank,

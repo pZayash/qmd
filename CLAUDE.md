@@ -58,9 +58,12 @@ qmd mcp stop                      # Stop background MCP daemon
   qmd vsearch "concept" -c mycollection --path archive/2024/
   qmd query "folder name" --kind dir
   qmd search "token" --kind file
+  qmd query "token" --path conf/Documents/ЗаказПокупателя/ --kind file
   ```
 
 - **Kind filter** — `--kind file|dir` (not repeatable) restricts hits to files or dir-nodes at SQL level before RRF. Omit = mix. Invalid value → exit 1. `QMD_DIR_NODES=0` wins over `--kind dir` (empty). Works with `query`, `search`, `vsearch`, MCP `query`.
+
+- **Agent drill** — after a dir hit: `qmd get` the L0, then search with `--path <dir>/` (trailing slash) and `--kind file`. MCP `query` has `path: string[]` (OR, same as CLI). No `drill`/`ls` tool. `get` payload unchanged.
 
 - **Collection mask** — only paths matching the collection glob are indexed. Example: mask `**/*.{md,bsl}` excludes `*.xml` (e.g. 1C `Form.xml`); add `xml` to the mask and run `qmd update` if those files must be searchable.
 

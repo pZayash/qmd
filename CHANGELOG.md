@@ -13,6 +13,9 @@
 - `--kind file|dir` on `qmd search` / `vsearch` / `query` and MCP `query`: hard SQL
   filter before RRF (omit = mix). Invalid value is an error. `QMD_DIR_NODES=0`
   still hides dirs even with `--kind dir` (empty result).
+- MCP `query.path` (`string[]`, OR prefixes, same as CLI `--path`) so agents can
+  drill: `get` dir L0, then query with `path: ["dirpath/"]` and `kind: "file"`.
+  No auto-slash; no new `drill` tool. Restart MCP daemon to pick up the schema.
 
 - Added: `QMD_EMBED_CONCURRENCY` for parallel OpenRouter embedding with 429
   backoff and abort propagation (local llama path unchanged).

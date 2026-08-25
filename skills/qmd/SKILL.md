@@ -26,6 +26,8 @@ Local search engine for markdown content.
     { "type": "vec", "query": "tradeoff between consistency and availability" }
   ],
   "collections": ["docs"],
+  "path": ["docs/ai/"],
+  "kind": "file",
   "limit": 10
 }
 ```
@@ -106,6 +108,18 @@ Note: `-term` only works in lex queries, not vec/hyde.
 
 Omit to search all collections.
 
+### Path and kind
+
+```json
+{ "path": ["docs/ai/"], "kind": "file" }
+```
+
+`path` is an array of collection-relative prefixes (OR), same as CLI `--path`. Leading `/` is stripped; trailing `/` is kept.
+
+### Agent drill
+
+After a `kind: dir` hit: `get` the dir-node (L0 body), then `query` with `path: ["<dirpath>/"]` (trailing slash) and typically `kind: "file"`. No `drill` command. Trailing `/` is required so sibling names are not prefix-matched.
+
 ## Other MCP Tools
 
 | Tool | Use |
@@ -122,6 +136,8 @@ qmd query $'lex: X\nvec: Y'       # Structured
 qmd query $'expand: question'     # Explicit expand
 qmd query --json --explain "q"    # Show score traces (RRF + rerank blend)
 qmd search "keywords"             # BM25 only (no LLM)
+qmd query "folder" --kind dir     # Dir-nodes only
+qmd query "token" --path docs/ai/ --kind file  # Drill into folder files
 qmd get "#abc123"                 # By docid
 qmd multi-get "journals/2026-*.md" -l 40  # Batch pull snippets by glob
 qmd multi-get notes/foo.md,notes/bar.md   # Comma-separated list, preserves order

@@ -713,6 +713,7 @@ qmd query "user authentication"
 -c, --collection   # Restrict search to a specific collection
 --path <prefix>    # Restrict to collection-relative path prefix (repeatable, OR)
 --kind file|dir    # Restrict to files or dir-nodes (omit = both)
+# MCP query also takes path: ["prefix/"] (OR) — drill: get dir L0, then path+kind file
 --all              # Return all matches (use with --min-score to filter)
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content

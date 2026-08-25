@@ -348,6 +348,14 @@ describe("MCP Server", () => {
       expect(results.length).toBe(1);
     });
 
+    test("path prefix restricts FTS to that folder", () => {
+      const hits = searchFTS(testDb, "meeting", 10, "docs", ["meetings/"], "file");
+      expect(hits.length).toBeGreaterThan(0);
+      expect(hits.every(h => h.kind === "file")).toBe(true);
+      expect(hits.every(h => h.displayPath.includes("/meetings/"))).toBe(true);
+      expect(hits.some(h => h.displayPath.includes("readme"))).toBe(false);
+    });
+
     // Note: Collection filtering tests removed - collections are now managed in YAML, not DB
 
     test("formats results as structured content", () => {
@@ -1124,13 +1132,38 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
 
     const { status, json } = await mcpRequest({
       jsonrpc: "2.0", id: 3, method: "tools/call",
-      params: { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }] } },
+      params: { name: "query", arguments: { searches: [{ type: "lex", query: "readme" }], rerank: false } },
     });
     expect(status).toBe(200);
     expect(json.result).toBeDefined();
     // Should have content array with text results
     expect(json.result.content.length).toBeGreaterThan(0);
     expect(json.result.content[0].type).toBe("text");
+  });
+
+  test("POST /mcp tools/call query path scopes to prefix", async () => {
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 5, method: "tools/call",
+      params: {
+        name: "query",
+        arguments: {
+          searches: [{ type: "lex", query: "meeting" }],
+          path: ["meetings/"],
+          kind: "file",
+          rerank: false,
+        },
+      },
+    });
+    expect(status).toBe(200);
+    expect(json.result).toBeDefined();
+    const text = json.result.content?.[0]?.text ?? "";
+    expect(text.toLowerCase()).toContain("meetings/");
+    expect(text.toLowerCase()).not.toContain("readme.md");
   });
 
   test("POST /mcp tools/call get returns document", async () => {
