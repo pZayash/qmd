@@ -31,6 +31,7 @@ import {
   type IndexStatus,
   type HybridQueryResult,
   type SearchResult,
+  parseDocumentKind,
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import {
@@ -65,6 +66,7 @@ type SearchResultItem = {
   score: number;
   context: string | null;
   snippet: string;
+  kind: "file" | "dir";
 };
 
 type StatusResult = {
@@ -102,7 +104,8 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
   }
   const lines = [`Found ${results.length} result${results.length === 1 ? '' : 's'} for "${query}":\n`];
   for (const r of results) {
-    lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
+    const dirPrefix = r.kind === "dir" ? "[dir] " : "";
+    lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${dirPrefix}${r.file} - ${r.title}`);
   }
   return lines.join('\n');
 }
@@ -331,6 +334,9 @@ Intent-aware lex (C++ performance, not sports):
           "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
         ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
+        kind: z.enum(["file", "dir"]).optional().describe(
+          "Restrict hits to files or directory L0 nodes. Omit to mix both. QMD_DIR_NODES=0 hides dirs even when kind=dir."
+        ),
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
@@ -339,7 +345,7 @@ Intent-aware lex (C++ performance, not sports):
         ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections, kind, intent, rerank }) => {
       // Map to internal format
       const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
@@ -356,6 +362,7 @@ Intent-aware lex (C++ performance, not sports):
         minScore,
         rerank,
         intent,
+        kind,
       });
 
       // Use first lex or vec query for snippet extraction
@@ -365,13 +372,15 @@ Intent-aware lex (C++ performance, not sports):
 
       const filtered: SearchResultItem[] = results.map(r => {
         const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300, undefined, undefined, intent);
+        const displayFile = r.kind === "dir" ? `${r.displayPath}/` : r.displayPath;
         return {
           docid: `#${r.docid}`,
-          file: r.displayPath,
+          file: displayFile,
           title: r.title,
           score: Math.round(r.score * 100) / 100,
           context: r.context,
           snippet: addLineNumbers(snippet, line),
+          kind: r.kind,
         };
       });
 
@@ -701,10 +710,11 @@ function formatHybridOutput(
       const items = results.map(r => ({
         docid: `#${r.docid}`,
         score: Math.round(r.score * 100) / 100,
-        file: r.displayPath,
+        file: r.kind === "dir" ? `${r.displayPath}/` : r.displayPath,
+        ...(r.kind !== "file" && { kind: r.kind }),
         title: r.title,
         ...(r.context && { context: r.context }),
-        snippet: extractSnippet(r.bestChunk, query, 300, undefined, undefined, opts.intent).snippet,
+        snippet: extractSnippet(r.bestChunk, query,  300, undefined, undefined, opts.intent).snippet,
       }));
       return JSON.stringify(items, null, 2);
     }
@@ -754,6 +764,7 @@ async function executeRpcCommand(argv: string[], _cwd: string, store: QMDStore):
         explain:        { type: "boolean" },
         intent:         { type: "string" },
         path:           { type: "string", multiple: true },
+        kind:           { type: "string" },
         "no-rerank":    { type: "boolean" },
         "skip-rerank":  { type: "boolean" },
         C:              { type: "string" },
@@ -787,10 +798,20 @@ async function executeRpcCommand(argv: string[], _cwd: string, store: QMDStore):
       .map(p => p.replace(/\\/g, "/").replace(/^\/+/, ""));
     const fmtOpts          = { full: !!values.full, lineNumbers: !!values["line-numbers"], intent: intentStr };
 
-    switch (command) {
+    let kind: "file" | "dir" | undefined;
+    if (values.kind) {
+      try {
+        kind = parseDocumentKind(String(values.kind));
+      } catch (e) {
+        err((e as Error).message);
+        exitCode = 1;
+      }
+    }
+
+    if (exitCode === 0) switch (command) {
       case "search": {
         if (!query) { err("Usage: qmd search [options] <query>"); exitCode = 1; break; }
-        const results = await store.searchLex(query, { limit, collection: collectionOpt, pathPrefixes });
+        const results = await store.searchLex(query, { limit, collection: collectionOpt, pathPrefixes, kind });
         out(formatSearchOutput(results, query, format, fmtOpts));
         break;
       }
@@ -799,7 +820,7 @@ async function executeRpcCommand(argv: string[], _cwd: string, store: QMDStore):
       case "vector-search": {
         if (!query) { err("Usage: qmd vsearch [options] <query>"); exitCode = 1; break; }
         const effectiveMinScore = minScore || 0.3;
-        let results = await store.searchVector(query, { limit, collection: collectionOpt, pathPrefixes });
+        let results = await store.searchVector(query, { limit, collection: collectionOpt, pathPrefixes, kind });
         results = results.filter(r => r.score >= effectiveMinScore);
         out(formatSearchOutput(results, query, format, fmtOpts));
         break;
@@ -814,6 +835,7 @@ async function executeRpcCommand(argv: string[], _cwd: string, store: QMDStore):
           minScore,
           collection: collectionOpt,
           pathPrefixes,
+          kind,
           intent:     intentStr,
           rerank:     !(values["skip-rerank"] || values["no-rerank"]),
           explain:    !!values.explain,

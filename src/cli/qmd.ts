@@ -58,6 +58,7 @@ import {
   updateDocument,
   deactivateDocument,
   getActiveDocumentPaths,
+  getActiveFileDocumentPaths,
   cleanupOrphanedContent,
   deleteLLMCache,
   deleteInactiveDocuments,
@@ -90,6 +91,8 @@ import {
   syncConfigToDb,
   type ReindexResult,
   type ChunkStrategy,
+  type DocumentKind,
+  parseDocumentKind,
 } from "../store.js";
 import { slugifyAnchor } from "../links.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
@@ -114,6 +117,7 @@ import {
   setConfigIndexName,
   loadConfig,
   loadConfigEnv,
+  getEffectiveL0Source,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
 
@@ -646,6 +650,7 @@ async function updateFiles(filePaths: string[], strict: boolean): Promise<void> 
       const eta = info.current > 2 ? ` ETA: ${formatETA(remaining)}` : "";
       if (isTTY) process.stderr.write(`\rIndexing: ${info.current}/${info.total}${eta}        `);
     },
+    resolveL0Source: resolveL0SourceForCollection,
   });
 
   progress.clear();
@@ -661,6 +666,16 @@ async function updateFiles(filePaths: string[], strict: boolean): Promise<void> 
   if (needsEmbedding > 0) {
     console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
   }
+}
+
+function resolveL0SourceForCollection(collectionName: string) {
+  const config = loadConfig();
+  const coll = getCollectionFromYaml(collectionName);
+  return getEffectiveL0Source(coll, config);
+}
+
+function formatHitPath(displayPath: string, kind?: DocumentKind): string {
+  return kind === "dir" ? `${displayPath}/` : displayPath;
 }
 
 async function updateCollections(): Promise<void> {
@@ -728,6 +743,7 @@ async function updateCollections(): Promise<void> {
 
     const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
       ignorePatterns: yamlCol?.ignore,
+      l0Source: resolveL0SourceForCollection(col.name),
       onProgress: (info) => {
         progress.set((info.current / info.total) * 100);
         const elapsed = (Date.now() - startTime) / 1000;
@@ -1723,7 +1739,7 @@ async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, coll
   }
 
   // Deactivate documents in this collection that no longer exist
-  const allActive = getActiveDocumentPaths(db, collectionName);
+  const allActive = getActiveFileDocumentPaths(db, collectionName);
   let removed = 0;
   for (const path of allActive) {
     if (!seenPaths.has(path)) {
@@ -1996,6 +2012,7 @@ type OutputOptions = {
   all?: boolean;
   collection?: string | string[];  // Filter by collection name(s)
   pathPrefixes?: string[];         // Filter by collection-relative path prefix(es)
+  kind?: DocumentKind;             // Filter to file or dir (omit = both)
   lineNumbers?: boolean; // Add line numbers to output
   explain?: boolean;     // Include retrieval score traces (query only)
   context?: string;      // Optional context for query expansion
@@ -2076,6 +2093,7 @@ type OutputRow = {
   chunkPos?: number;
   hash?: string;
   docid?: string;
+  kind?: DocumentKind;
   explain?: HybridQueryExplain;
 };
 
@@ -2166,7 +2184,8 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       return {
         ...(docid && { docid: `#${docid}` }),
         score: Math.round(row.score * 100) / 100,
-        file: toQmdPath(row.displayPath),
+        file: toQmdPath(formatHitPath(row.displayPath, row.kind)),
+        ...(row.kind && row.kind !== "file" && { kind: row.kind }),
         ...(snippetInfo && { line: snippetInfo.line }),
         title: row.title,
         ...(row.context && { context: row.context }),
@@ -2199,7 +2218,7 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
       const absolutePath = resolveVirtualPath(linkDb, virtualPath);
 
       const legacyPath = toQmdPath(row.displayPath);
-      const displayPath = parsed?.path || row.displayPath;
+      const displayPath = formatHitPath(parsed?.path || row.displayPath, row.kind);
 
       // Only show :line if we actually found a term match in the snippet body (exclude header line).
       const snippetBody = snippet.split("\n").slice(1).join("\n").toLowerCase();
@@ -2218,7 +2237,8 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
 
       // Line 2: Title (if available)
       if (row.title) {
-        console.log(`${c.bold}Title: ${row.title}${c.reset}`);
+        const dirTag = row.kind === "dir" ? `${c.dim}[dir] ${c.reset}` : "";
+        console.log(`${dirTag}${c.bold}Title: ${row.title}${c.reset}`);
       }
 
       // Line 3: Context (if available)
@@ -2438,7 +2458,7 @@ function search(query: string, opts: OutputOptions): void {
   // Use large limit for --all, otherwise fetch more than needed and let outputResults filter
   const fetchLimit = opts.all ? 100000 : Math.max(50, opts.limit * 2);
   const results = filterByCollections(
-    searchFTS(db, query, fetchLimit, singleCollection, opts.pathPrefixes),
+    searchFTS(db, query, fetchLimit, singleCollection, opts.pathPrefixes, opts.kind),
     collectionNames
   );
 
@@ -2452,6 +2472,7 @@ function search(query: string, opts: OutputOptions): void {
     context: getContextForFile(db, r.filepath),
     hash: r.hash,
     docid: r.docid,
+    kind: r.kind,
   }));
 
   closeDb();
@@ -2493,6 +2514,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
       pathPrefixes: opts.pathPrefixes,
+      kind: opts.kind,
       limit: opts.all ? 500 : (opts.limit || 10),
       minScore: opts.minScore || 0.3,
       intent: opts.intent,
@@ -2527,6 +2549,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
       score: r.score,
       context: r.context,
       docid: r.docid,
+      kind: r.kind,
     })), query, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
@@ -2571,6 +2594,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       results = await structuredSearch(store, structuredQueries, {
         collections: singleCollection ? [singleCollection] : undefined,
         pathPrefixes: opts.pathPrefixes,
+        kind: opts.kind,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2607,6 +2631,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       results = await hybridQuery(store, query, {
         collection: singleCollection,
         pathPrefixes: opts.pathPrefixes,
+        kind: opts.kind,
         limit: opts.all ? 500 : (opts.limit || 10),
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
@@ -2688,9 +2713,21 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
       score: r.score,
       context: r.context,
       docid: r.docid,
+      kind: r.kind,
       explain: r.explain,
     })), displayQuery, { ...opts, limit: results.length });
   }, { maxDuration: 10 * 60 * 1000, name: 'querySearch' });
+}
+
+function parseCliKind(raw: unknown): DocumentKind | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  try {
+    return parseDocumentKind(String(raw));
+  } catch (e) {
+    console.error((e as Error).message);
+    process.exit(1);
+    return undefined;
+  }
 }
 
 // Parse CLI arguments using util.parseArgs
@@ -2723,6 +2760,7 @@ function parseCLI() {
       explain: { type: "boolean" },
       collection: { type: "string", short: "c", multiple: true },  // Filter by collection(s)
       path: { type: "string", multiple: true },  // Filter by path prefix(es)
+      kind: { type: "string" },  // Filter by document kind: file|dir
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
@@ -2787,6 +2825,7 @@ function parseCLI() {
     all: isAll,
     collection: values.collection as string[] | undefined,
     pathPrefixes: (values.path as string[] | undefined)?.map(p => p.replace(/\\/g, '/').replace(/^\//, '')),
+    kind: parseCliKind(values.kind),
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
@@ -3200,6 +3239,7 @@ function showHelp(): void {
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("  --path <prefix>            - Restrict to collection-relative path prefix; repeatable (OR)");
+  console.log("  --kind file|dir            - Restrict to files or dir-nodes (omit = both; QMD_DIR_NODES=0 hides dirs)");
   console.log("");
   console.log("Embed/query options:");
   console.log("  --chunk-strategy <auto|regex> - Chunking mode (default: regex; auto uses AST for code files)");

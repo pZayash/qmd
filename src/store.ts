@@ -37,6 +37,22 @@ import type {
 } from "./collections.js";
 import type { LinkRef } from "./links.js";
 import { slugifyAnchor } from "./links.js";
+import {
+  ancestorDirPaths,
+  buildExtractiveL0,
+  chooseL0Text,
+  collectDirPathsFromFiles,
+  dirHasIndexedFiles,
+  getDirectChildren,
+  peek1cXml,
+  readContractL0,
+  readFirstMarkdownHeading,
+  xmlPathForDir,
+  parseDocumentKind,
+  type L0Source,
+} from "./dir-node.js";
+
+export { parseDocumentKind } from "./dir-node.js";
 
 // =============================================================================
 // Configuration
@@ -859,10 +875,16 @@ function initializeDatabase(db: Database): void {
       created_at TEXT NOT NULL,
       modified_at TEXT NOT NULL,
       active INTEGER NOT NULL DEFAULT 1,
+      kind TEXT NOT NULL DEFAULT 'file',
       FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
       UNIQUE(collection, path)
     )
   `);
+
+  const documentsInfo = db.prepare(`PRAGMA table_info(documents)`).all() as { name: string }[];
+  if (documentsInfo.length > 0 && !documentsInfo.some(col => col.name === "kind")) {
+    db.exec(`ALTER TABLE documents ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'`);
+  }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection, active)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash)`);
@@ -1395,8 +1417,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string, pathPrefixes?: string[]) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefixes?: string[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collectionName?: string, pathPrefixes?: string[], kind?: DocumentKind) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefixes?: string[], kind?: DocumentKind) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1438,6 +1460,29 @@ export type ReindexProgress = {
   current: number;
   total: number;
 };
+
+export type DocumentKind = "file" | "dir";
+
+export function dirNodesDisabled(): boolean {
+  return process.env.QMD_DIR_NODES === "0";
+}
+
+/** SQL kind predicate: undefined = mix; empty = no rows; file/dir = constrain. */
+export function resolveRetrievalKind(kind?: DocumentKind): DocumentKind | "empty" | undefined {
+  if (dirNodesDisabled()) {
+    if (kind === "dir") {
+      console.error("QMD_DIR_NODES=0: dir hits disabled (--kind dir returns no results)");
+      return "empty";
+    }
+    return "file";
+  }
+  return kind;
+}
+
+function omitDirHits<T extends { kind?: DocumentKind }>(results: T[]): T[] {
+  if (!dirNodesDisabled()) return results;
+  return results.filter(r => r.kind !== "dir");
+}
 
 export type ReindexResult = {
   indexed: number;
@@ -1676,6 +1721,134 @@ export async function indexDocumentAtPath(
   return "indexed";
 }
 
+export type ReindexDirOptions = {
+  resolveL0Source?: (collectionName: string) => L0Source;
+};
+
+function getActiveFilePaths(db: Database, collectionName: string): string[] {
+  const rows = db.prepare(`
+    SELECT path FROM documents
+    WHERE collection = ? AND active = 1 AND kind = 'file'
+  `).all(collectionName) as { path: string }[];
+  return rows.map(r => r.path);
+}
+
+function getActiveDirPaths(db: Database, collectionName: string): string[] {
+  const rows = db.prepare(`
+    SELECT path FROM documents
+    WHERE collection = ? AND active = 1 AND kind = 'dir'
+  `).all(collectionName) as { path: string }[];
+  return rows.map(r => r.path);
+}
+
+function deactivateDirNode(db: Database, collectionName: string, dirPath: string): number {
+  const result = db.prepare(`
+    UPDATE documents SET active = 0
+    WHERE collection = ? AND path = ? AND kind = 'dir' AND active = 1
+  `).run(collectionName, dirPath);
+  return result.changes;
+}
+
+async function upsertDirNode(
+  db: Database,
+  collectionName: string,
+  collectionPath: string,
+  dirRelPath: string,
+  filePaths: string[],
+  l0Source: L0Source,
+  pathContextLookup: (path: string) => string | null,
+  now: string,
+): Promise<"indexed" | "updated" | "unchanged"> {
+  const { childDirs, childFiles } = getDirectChildren(filePaths, dirRelPath);
+  const pathContext = pathContextLookup(dirRelPath);
+  const xmlPeek = peek1cXml(xmlPathForDir(collectionPath, dirRelPath));
+  const extractive = buildExtractiveL0({
+    dirRelPath,
+    pathContext,
+    xmlPeek,
+    childDirs,
+    childFiles: childFiles.map(f => ({
+      basename: f.basename,
+      heading: readFirstMarkdownHeading(collectionPath, f.path),
+    })),
+  });
+  const contract = readContractL0(collectionPath, dirRelPath);
+  const l0Text = chooseL0Text({ source: l0Source, contract, extractive });
+  const hash = await hashContent(l0Text);
+  const title = dirRelPath.split("/").pop() || dirRelPath;
+  const existing = findActiveDocument(db, collectionName, dirRelPath);
+
+  if (existing?.hash === hash) {
+    if (existing.kind !== "dir") {
+      db.prepare(`UPDATE documents SET kind = 'dir' WHERE id = ?`).run(existing.id);
+      return "updated";
+    }
+    return "unchanged";
+  }
+
+  insertContent(db, hash, l0Text, now);
+  if (existing) {
+    updateDocument(db, existing.id, title, hash, now, "dir");
+    return "updated";
+  }
+
+  insertDocument(db, collectionName, dirRelPath, title, hash, now, now, "dir");
+  return "indexed";
+}
+
+export async function rebuildDirNodes(
+  db: Database,
+  collectionName: string,
+  collectionPath: string,
+  options: {
+    l0Source: L0Source;
+    pathContextLookup: (path: string) => string | null;
+    limitToDirs?: string[];
+  },
+): Promise<{ upserted: number; deactivated: number }> {
+  const now = new Date().toISOString();
+  const filePaths = getActiveFilePaths(db, collectionName);
+  const desiredDirs = collectDirPathsFromFiles(filePaths);
+
+  let targetDirs: Set<string>;
+  if (options.limitToDirs) {
+    targetDirs = new Set(options.limitToDirs);
+  } else {
+    targetDirs = desiredDirs;
+  }
+
+  let upserted = 0;
+  let deactivated = 0;
+
+  for (const dirPath of targetDirs) {
+    if (!dirHasIndexedFiles(filePaths, dirPath)) {
+      deactivated += deactivateDirNode(db, collectionName, dirPath);
+      continue;
+    }
+    const result = await upsertDirNode(
+      db,
+      collectionName,
+      collectionPath,
+      dirPath,
+      filePaths,
+      options.l0Source,
+      options.pathContextLookup,
+      now,
+    );
+    if (result === "indexed" || result === "updated") upserted++;
+  }
+
+  if (!options.limitToDirs) {
+    for (const dirPath of getActiveDirPaths(db, collectionName)) {
+      if (!desiredDirs.has(dirPath)) {
+        deactivated += deactivateDirNode(db, collectionName, dirPath);
+      }
+    }
+  }
+
+  return { upserted, deactivated };
+}
+
 /**
  * Re-index only the given paths within their collections.
  * Does not deactivate documents outside the provided list.
@@ -1685,16 +1858,20 @@ export async function reindexFiles(
   targets: ReindexFileTarget[],
   options?: {
     onProgress?: (info: ReindexProgress) => void;
+    resolveL0Source?: (collectionName: string) => L0Source;
   },
 ): Promise<ReindexResult> {
   const db = store.db;
   const now = new Date().toISOString();
   const total = targets.length;
   let indexed = 0, updated = 0, unchanged = 0, removed = 0, processed = 0;
+  const resolveL0 = options?.resolveL0Source ?? (() => "n" as L0Source);
+  const limitDirsByCollection = new Map<string, Set<string>>();
 
   for (const target of targets) {
     const filepath = resolve(target.collectionPath, target.relativePath);
     const fileExists = existsSync(filepath);
+    const relPath = handelize(target.relativePath);
 
     if (fileExists) {
       const result = await indexDocumentAtPath(
@@ -1710,11 +1887,30 @@ export async function reindexFiles(
         case "unchanged": unchanged++; break;
       }
     } else {
-      removed += deactivateDocument(db, target.collectionName, target.relativePath);
+      removed += deactivateDocument(db, target.collectionName, relPath);
+    }
+
+    let dirSet = limitDirsByCollection.get(target.collectionName);
+    if (!dirSet) {
+      dirSet = new Set<string>();
+      limitDirsByCollection.set(target.collectionName, dirSet);
+    }
+    for (const d of ancestorDirPaths(relPath)) {
+      dirSet.add(d);
     }
 
     processed++;
     options?.onProgress?.({ file: target.relativePath, current: processed, total });
+  }
+
+  for (const [collectionName, dirSet] of limitDirsByCollection) {
+    const collectionPath = targets.find(t => t.collectionName === collectionName)?.collectionPath;
+    if (!collectionPath) continue;
+    await rebuildDirNodes(db, collectionName, collectionPath, {
+      l0Source: resolveL0(collectionName),
+      pathContextLookup: (path) => getContextForPath(db, collectionName, path),
+      limitToDirs: [...dirSet],
+    });
   }
 
   const orphanedCleaned = cleanupOrphanedContent(db);
@@ -1733,6 +1929,7 @@ export async function reindexCollection(
   options?: {
     ignorePatterns?: string[];
     onProgress?: (info: ReindexProgress) => void;
+    l0Source?: L0Source;
   }
 ): Promise<ReindexResult> {
   const db = store.db;
@@ -1775,8 +1972,8 @@ export async function reindexCollection(
     options?.onProgress?.({ file: relativeFile, current: processed, total });
   }
 
-  // Deactivate documents that no longer exist
-  const allActive = getActiveDocumentPaths(db, collectionName);
+  // Deactivate file documents that no longer exist
+  const allActive = getActiveFilePaths(db, collectionName);
   let removed = 0;
   for (const path of allActive) {
     if (!seenPaths.has(path)) {
@@ -1784,6 +1981,11 @@ export async function reindexCollection(
       removed++;
     }
   }
+
+  await rebuildDirNodes(db, collectionName, collectionPath, {
+    l0Source: options?.l0Source ?? "n",
+    pathContextLookup: (path) => getContextForPath(db, collectionName, path),
+  });
 
   resolveDocEdges(db, collectionName);
 
@@ -2199,8 +2401,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string, pathPrefixes?: string[]) => searchFTS(db, query, limit, collectionName, pathPrefixes),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefixes?: string[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, pathPrefixes),
+    searchFTS: (query: string, limit?: number, collectionName?: string, pathPrefixes?: string[], kind?: DocumentKind) => searchFTS(db, query, limit, collectionName, pathPrefixes, kind),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefixes?: string[], kind?: DocumentKind) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, pathPrefixes, kind),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent, store.llm),
@@ -2254,6 +2456,7 @@ export type DocumentResult = {
   collectionName: string;     // Parent collection name
   modifiedAt: string;         // Last modification timestamp
   bodyLength: number;         // Body length in bytes (useful before loading)
+  kind: DocumentKind;         // file | dir
   body?: string;              // Document body (optional, load with getDocumentBody)
 };
 
@@ -2352,6 +2555,7 @@ export type RankedResult = {
   title: string;
   body: string;
   score: number;
+  kind?: DocumentKind;
 };
 
 export type RRFContributionTrace = {
@@ -2930,7 +3134,7 @@ export function resolveDocEdges(db: Database, collectionName: string): void {
   const activeDocs = db.prepare(`
     SELECT id, path, title, hash
     FROM documents
-    WHERE collection = ? AND active = 1
+    WHERE collection = ? AND active = 1 AND kind = 'file'
   `).all(collectionName) as { id: number; path: string; title: string; hash: string }[];
 
   const pathIndex = new Map<string, number>();
@@ -3144,17 +3348,19 @@ export function insertDocument(
   title: string,
   hash: string,
   createdAt: string,
-  modifiedAt: string
+  modifiedAt: string,
+  kind: DocumentKind = "file",
 ): void {
   db.prepare(`
-    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
+    INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active, kind)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
     ON CONFLICT(collection, path) DO UPDATE SET
       title = excluded.title,
       hash = excluded.hash,
       modified_at = excluded.modified_at,
+      kind = excluded.kind,
       active = 1
-  `).run(collectionName, path, title, hash, createdAt, modifiedAt);
+  `).run(collectionName, path, title, hash, createdAt, modifiedAt, kind);
 }
 
 /**
@@ -3163,12 +3369,12 @@ export function insertDocument(
 export function findActiveDocument(
   db: Database,
   collectionName: string,
-  path: string
-): { id: number; hash: string; title: string } | null {
+  path: string,
+): { id: number; hash: string; title: string; kind: DocumentKind } | null {
   const row = db.prepare(`
-    SELECT id, hash, title FROM documents
+    SELECT id, hash, title, COALESCE(kind, 'file') as kind FROM documents
     WHERE collection = ? AND path = ? AND active = 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
+  `).get(collectionName, path) as { id: number; hash: string; title: string; kind: DocumentKind } | undefined;
   return row ?? null;
 }
 
@@ -3245,10 +3451,16 @@ export function updateDocument(
   documentId: number,
   title: string,
   hash: string,
-  modifiedAt: string
+  modifiedAt: string,
+  kind?: DocumentKind,
 ): void {
-  db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
-    .run(title, hash, modifiedAt, documentId);
+  if (kind !== undefined) {
+    db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ?, kind = ? WHERE id = ?`)
+      .run(title, hash, modifiedAt, kind, documentId);
+  } else {
+    db.prepare(`UPDATE documents SET title = ?, hash = ?, modified_at = ? WHERE id = ?`)
+      .run(title, hash, modifiedAt, documentId);
+  }
 }
 
 /**
@@ -3268,6 +3480,10 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
     SELECT path FROM documents WHERE collection = ? AND active = 1
   `).all(collectionName) as { path: string }[];
   return rows.map(r => r.path);
+}
+
+export function getActiveFileDocumentPaths(db: Database, collectionName: string): string[] {
+  return getActiveFilePaths(db, collectionName);
 }
 
 export { formatQueryForEmbedding, formatDocForEmbedding };
@@ -4127,7 +4343,10 @@ function fileMatchesPathPrefixes(file: string, pathPrefixes?: string[]): boolean
   return normalizedPrefixes.some(prefix => normalizedPath.startsWith(prefix));
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string, pathPrefixes?: string[]): SearchResult[] {
+export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string, pathPrefixes?: string[], kind?: DocumentKind): SearchResult[] {
+  const resolvedKind = resolveRetrievalKind(kind);
+  if (resolvedKind === "empty") return [];
+
   query = stripLexPrefixForFtsQuery(query);
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
@@ -4151,6 +4370,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     const clauses = pathPrefixes.map(() => `d_filter.path LIKE ? || '%'`).join(' OR ');
     docFilters.push(`(${clauses})`);
     docFilterParams.push(...pathPrefixes);
+  }
+
+  if (resolvedKind === "file" || resolvedKind === "dir") {
+    docFilters.push(`COALESCE(d_filter.kind, 'file') = ?`);
+    docFilterParams.push(resolvedKind);
   }
 
   if (docFilters.length > 1) {
@@ -4178,6 +4402,7 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       d.title,
       content.doc as body,
       d.hash,
+      COALESCE(d.kind, 'file') as kind,
       fm.bm25_score
     FROM fts_matches fm
     JOIN documents d ON d.id = fm.rowid
@@ -4190,8 +4415,8 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
   params.push(limit);
 
-  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; bm25_score: number }[];
-  return rows.map(row => {
+  const rows = db.prepare(sql).all(...params) as { filepath: string; display_path: string; title: string; body: string; hash: string; kind: DocumentKind; bm25_score: number }[];
+  return omitDirHits(rows.map(row => {
     const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
     // Convert bm25 (negative, lower is better) into a stable [0..1) score where higher is better.
     // FTS5 BM25 scores are negative (e.g., -10 is strong, -2 is weak).
@@ -4211,8 +4436,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
       context: getContextForFile(db, row.filepath),
       score,
       source: "fts" as const,
+      kind: row.kind ?? "file",
     };
-  });
+  }));
 }
 
 // =============================================================================
@@ -4284,7 +4510,10 @@ function quantVecSearch(
   return scored.slice(0, vecK);
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefixes?: string[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], pathPrefixes?: string[], kind?: DocumentKind): Promise<SearchResult[]> {
+  const resolvedKind = resolveRetrievalKind(kind);
+  if (resolvedKind === "empty") return [];
+
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
@@ -4298,7 +4527,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
   // Inflate k when path-filtering: most ANN candidates may not match the narrow prefix
-  const vecK = pathPrefixes?.length ? limit * 30 : limit * 3;
+  const vecK = (pathPrefixes?.length || resolvedKind === "file" || resolvedKind === "dir") ? limit * 30 : limit * 3;
   const fullEmbedding = embedding instanceof Float32Array ? embedding : new Float32Array(embedding);
 
   // Quantized two-pass search (default) when the quant tables are populated;
@@ -4328,7 +4557,8 @@ export async function searchVec(db: Database, query: string, model: string, limi
       'qmd://' || d.collection || '/' || d.path as filepath,
       d.collection || '/' || d.path as display_path,
       d.title,
-      content.doc as body
+      content.doc as body,
+      COALESCE(d.kind, 'file') as kind
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
@@ -4347,9 +4577,14 @@ export async function searchVec(db: Database, query: string, model: string, limi
     params.push(...pathPrefixes);
   }
 
+  if (resolvedKind === "file" || resolvedKind === "dir") {
+    docSql += ` AND COALESCE(d.kind, 'file') = ?`;
+    params.push(resolvedKind);
+  }
+
   const docRows = db.prepare(docSql).all(...params) as {
     hash_seq: string; hash: string; pos: number; filepath: string;
-    display_path: string; title: string; body: string;
+    display_path: string; title: string; body: string; kind: DocumentKind;
   }[];
 
   // Combine with distances and dedupe by filepath
@@ -4362,7 +4597,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
     }
   }
 
-  return Array.from(seen.values())
+  return omitDirHits(Array.from(seen.values())
     .sort((a, b) => a.bestDist - b.bestDist)
     .map(({ row, bestDist }) => {
       const collectionName = row.filepath.split('//')[1]?.split('/')[0] || "";
@@ -4380,10 +4615,11 @@ export async function searchVec(db: Database, query: string, model: string, limi
         score: 1 - bestDist,  // Cosine similarity = 1 - cosine distance
         source: "vec" as const,
         chunkPos: row.pos,
+        kind: row.kind ?? "file",
       };
     })
     .filter(r => fileMatchesPathPrefixes(r.filepath, pathPrefixes))
-    .slice(0, limit);
+    .slice(0, limit));
 }
 
 // =============================================================================
@@ -4794,6 +5030,7 @@ type DbDocRow = {
   path: string;
   modified_at: string;
   body_length: number;
+  kind: DocumentKind;
   body?: string;
 };
 
@@ -4839,7 +5076,8 @@ export function findDocument(db: Database, filename: string, options: { includeB
     d.hash,
     d.collection,
     d.modified_at,
-    LENGTH(content.doc) as body_length
+    LENGTH(content.doc) as body_length,
+    COALESCE(d.kind, 'file') as kind
     ${bodyCol}
   `;
 
@@ -4908,6 +5146,7 @@ export function findDocument(db: Database, filename: string, options: { includeB
     collectionName: doc.collection,
     modifiedAt: doc.modified_at,
     bodyLength: doc.body_length,
+    kind: doc.kind ?? "file",
     ...(options.includeBody && doc.body !== undefined && { body: doc.body }),
   };
 }
@@ -4983,7 +5222,8 @@ export function findDocuments(
     d.hash,
     d.collection,
     d.modified_at,
-    LENGTH(content.doc) as body_length
+    LENGTH(content.doc) as body_length,
+    COALESCE(d.kind, 'file') as kind
     ${bodyCol}
   `;
 
@@ -5063,6 +5303,7 @@ export function findDocuments(
         collectionName: row.collection,
         modifiedAt: row.modified_at,
         bodyLength: row.body_length,
+        kind: row.kind ?? "file",
         ...(options.includeBody && row.body !== undefined && { body: row.body }),
       },
       skipped: false,
@@ -5286,6 +5527,7 @@ export interface SearchHooks {
 export interface HybridQueryOptions {
   collection?: string;
   pathPrefixes?: string[];  // restrict to collection-relative path prefixes
+  kind?: DocumentKind;      // restrict to file or dir (omit = both)
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -5306,6 +5548,7 @@ export interface HybridQueryResult {
   score: number;            // blended score (full precision)
   context: string | null;   // user-set context
   docid: string;            // content hash prefix (6 chars)
+  kind: DocumentKind;       // file | dir
   explain?: HybridQueryExplain;
 }
 
@@ -5338,6 +5581,7 @@ export async function hybridQuery(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const collection = options?.collection;
   const pathPrefixes = options?.pathPrefixes;
+  const kind = options?.kind;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
@@ -5355,7 +5599,7 @@ export async function hybridQuery(
   // match may not be what the caller wants (e.g. "performance" with intent
   // "web page load times" should NOT shortcut to a sports-performance doc).
   // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
-  const initialFts = store.searchFTS(query, 20, collection, pathPrefixes);
+  const initialFts = store.searchFTS(query, 20, collection, pathPrefixes, kind);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
   const hasStrongSignal = !intent && initialFts.length > 0
@@ -5378,7 +5622,7 @@ export async function hybridQuery(
     for (const r of initialFts) docidMap.set(r.filepath, r.docid);
     rankedLists.push(initialFts.map(r => ({
       file: r.filepath, displayPath: r.displayPath,
-      title: r.title, body: r.body || "", score: r.score,
+      title: r.title, body: r.body || "", score: r.score, kind: r.kind,
     })));
     rankedListMeta.push({ source: "fts", queryType: "original", query });
   }
@@ -5392,12 +5636,12 @@ export async function hybridQuery(
   // 3a: Run FTS for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.query, 20, collection, pathPrefixes);
+      const ftsResults = store.searchFTS(q.query, 20, collection, pathPrefixes, kind);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
+          title: r.title, body: r.body || "", score: r.score, kind: r.kind,
         })));
         rankedListMeta.push({ source: "fts", queryType: "lex", query: q.query });
       }
@@ -5430,13 +5674,13 @@ export async function hybridQuery(
 
       const vecResults = await store.searchVec(
         vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
-        undefined, embedding, pathPrefixes
+        undefined, embedding, pathPrefixes, kind
       );
       if (vecResults.length > 0) {
         for (const r of vecResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(vecResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
-          title: r.title, body: r.body || "", score: r.score,
+          title: r.title, body: r.body || "", score: r.score, kind: r.kind,
         })));
         rankedListMeta.push({
           source: "vec",
@@ -5520,6 +5764,7 @@ export async function hybridQuery(
           score: rrfScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
+          kind: cand.kind ?? "file",
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -5530,6 +5775,7 @@ export async function hybridQuery(
       })
       .filter(r => fileMatchesPathPrefixes(r.file, pathPrefixes))
       .filter(r => r.score >= minScore)
+      .filter(r => !dirNodesDisabled() || r.kind !== "dir")
       .slice(0, limit);
   }
 
@@ -5550,7 +5796,7 @@ export async function hybridQuery(
   // Step 7: Blend RRF position score with reranker score
   // Position-aware weights: top retrieval results get more protection from reranker disagreement
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
+    displayPath: c.displayPath, title: c.title, body: c.body, kind: c.kind,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -5595,6 +5841,7 @@ export async function hybridQuery(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      kind: candidate?.kind ?? "file",
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
@@ -5609,12 +5856,14 @@ export async function hybridQuery(
     })
     .filter(r => fileMatchesPathPrefixes(r.file, pathPrefixes))
     .filter(r => r.score >= minScore)
+    .filter(r => !dirNodesDisabled() || r.kind !== "dir")
     .slice(0, limit);
 }
 
 export interface VectorSearchOptions {
   collection?: string;
   pathPrefixes?: string[];  // restrict to collection-relative path prefixes
+  kind?: DocumentKind;      // restrict to file or dir (omit = both)
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
@@ -5629,6 +5878,7 @@ export interface VectorSearchResult {
   score: number;
   context: string | null;
   docid: string;
+  kind: DocumentKind;
 }
 
 /**
@@ -5669,7 +5919,7 @@ export async function vectorSearchQuery(
   const embeddings = await llm.embedBatch(queryTexts.map(t => formatQueryForEmbedding(t, llm.embedModelName)));
   for (let i = 0; i < queryTexts.length; i++) {
     const precomputed = embeddings[i]?.embedding;
-    const vecResults = await store.searchVec(queryTexts[i]!, llm.embedModelName, limit, collection, undefined, precomputed, pathPrefixes);
+    const vecResults = await store.searchVec(queryTexts[i]!, llm.embedModelName, limit, collection, undefined, precomputed, pathPrefixes, options?.kind);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -5681,6 +5931,7 @@ export async function vectorSearchQuery(
           score: r.score,
           context: store.getContextForFile(r.filepath),
           docid: r.docid,
+          kind: r.kind,
         });
       }
     }
@@ -5690,6 +5941,7 @@ export async function vectorSearchQuery(
     .sort((a, b) => b.score - a.score)
     .filter(r => fileMatchesPathPrefixes(r.file, pathPrefixes))
     .filter(r => r.score >= minScore)
+    .filter(r => !dirNodesDisabled() || r.kind !== "dir")
     .slice(0, limit);
 }
 
@@ -5704,6 +5956,7 @@ export async function vectorSearchQuery(
 export interface StructuredSearchOptions {
   collections?: string[];   // Filter to specific collections (OR match)
   pathPrefixes?: string[];  // restrict to collection-relative path prefixes
+  kind?: DocumentKind;      // restrict to file or dir (omit = both)
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -5749,6 +6002,7 @@ export async function structuredSearch(
 
   const collections = options?.collections;
   const pathPrefixes = options?.pathPrefixes;
+  const kind = options?.kind;
 
   if (searches.length === 0) return [];
 
@@ -5785,12 +6039,12 @@ export async function structuredSearch(
   for (const search of searches) {
     if (search.type === 'lex') {
       for (const coll of collectionList) {
-        const ftsResults = store.searchFTS(search.query, 20, coll, pathPrefixes);
+        const ftsResults = store.searchFTS(search.query, 20, coll, pathPrefixes, kind);
         if (ftsResults.length > 0) {
           for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(ftsResults.map(r => ({
             file: r.filepath, displayPath: r.displayPath,
-            title: r.title, body: r.body || "", score: r.score,
+            title: r.title, body: r.body || "", score: r.score, kind: r.kind,
           })));
           rankedListMeta.push({
             source: "fts",
@@ -5823,13 +6077,13 @@ export async function structuredSearch(
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
             vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
-            undefined, embedding, pathPrefixes
+            undefined, embedding, pathPrefixes, kind
           );
           if (vecResults.length > 0) {
             for (const r of vecResults) docidMap.set(r.filepath, r.docid);
             rankedLists.push(vecResults.map(r => ({
               file: r.filepath, displayPath: r.displayPath,
-              title: r.title, body: r.body || "", score: r.score,
+              title: r.title, body: r.body || "", score: r.score, kind: r.kind,
             })));
             rankedListMeta.push({
               source: "vec",
@@ -5922,6 +6176,7 @@ export async function structuredSearch(
           score: rrfScore,
           context: store.getContextForFile(cand.file),
           docid: docidMap.get(cand.file) || "",
+          kind: cand.kind ?? "file",
           ...(explainData ? { explain: explainData } : {}),
         };
       })
@@ -5932,6 +6187,7 @@ export async function structuredSearch(
       })
       .filter(r => fileMatchesPathPrefixes(r.file, pathPrefixes))
       .filter(r => r.score >= minScore)
+      .filter(r => !dirNodesDisabled() || r.kind !== "dir")
       .slice(0, limit);
   }
 
@@ -5951,7 +6207,7 @@ export async function structuredSearch(
 
   // Step 6: Blend RRF position score with reranker score
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body,
+    displayPath: c.displayPath, title: c.title, body: c.body, kind: c.kind,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -5996,6 +6252,7 @@ export async function structuredSearch(
       score: blendedScore,
       context: store.getContextForFile(r.file),
       docid: docidMap.get(r.file) || "",
+      kind: candidate?.kind ?? "file",
       ...(explainData ? { explain: explainData } : {}),
     };
   }).sort((a, b) => b.score - a.score);
@@ -6010,5 +6267,6 @@ export async function structuredSearch(
     })
     .filter(r => fileMatchesPathPrefixes(r.file, pathPrefixes))
     .filter(r => r.score >= minScore)
+    .filter(r => !dirNodesDisabled() || r.kind !== "dir")
     .slice(0, limit);
 }

@@ -4,6 +4,16 @@
 
 ### Features
 
+- Directory **dir-nodes**: on `qmd update`, build searchable L0 summaries per folder
+  that contains indexed files; `qmd query` / FTS / vec can return `kind: dir` hits.
+  Config `l0_source`: `n` (extractive only) or `p` (read `.qmd/l0/<relpath>.md` when
+  present). For 1C object dirs, peek sibling `*.xml` Name + ru Synonym (xml not indexed).
+  Kill switch: `QMD_DIR_NODES=0` omits dir hits from query. After upgrade run
+  `qmd update` then `qmd embed`. `l0_source: q` is reserved (no API generate yet).
+- `--kind file|dir` on `qmd search` / `vsearch` / `query` and MCP `query`: hard SQL
+  filter before RRF (omit = mix). Invalid value is an error. `QMD_DIR_NODES=0`
+  still hides dirs even with `--kind dir` (empty result).
+
 - Added: `QMD_EMBED_CONCURRENCY` for parallel OpenRouter embedding with 429
   backoff and abort propagation (local llama path unchanged).
 

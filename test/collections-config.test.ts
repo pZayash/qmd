@@ -8,7 +8,16 @@
 import { describe, test, expect, beforeEach, afterEach } from "vitest";
 import { join } from "path";
 import { homedir } from "os";
-import { getConfigPath, setConfigIndexName } from "../src/collections.js";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import YAML from "yaml";
+import {
+  getConfigPath,
+  setConfigIndexName,
+  loadConfig,
+  saveConfig,
+  getCollection,
+} from "../src/collections.js";
 
 // Save/restore env vars around each test
 let savedEnv: Record<string, string | undefined>;
@@ -70,5 +79,43 @@ describe("getConfigDir via getConfigPath", () => {
     process.env.XDG_CONFIG_HOME = "/xdg/config";
     setConfigIndexName("myindex");
     expect(getConfigPath()).toBe(join("/xdg/config", "qmd", "myindex.yml"));
+  });
+});
+
+describe("l0_source config round-trip", () => {
+  let configDir = "";
+
+  beforeEach(async () => {
+    configDir = await mkdtemp(join(tmpdir(), "qmd-l0-config-"));
+    process.env.QMD_CONFIG_DIR = configDir;
+  });
+
+  afterEach(async () => {
+    delete process.env.QMD_CONFIG_DIR;
+    await rm(configDir, { recursive: true, force: true });
+  });
+
+  test("persists l0_source on collection and models", async () => {
+    saveConfig({
+      collections: {
+        notes: {
+          path: "/tmp/notes",
+          pattern: "**/*.md",
+          l0Source: "p",
+        },
+      },
+      models: {
+        l0Source: "n",
+      },
+    });
+
+    const raw = await import("node:fs/promises").then(fs =>
+      fs.readFile(join(configDir, "index.yml"), "utf-8"),
+    );
+    expect(raw).toContain("l0Source: p");
+
+    const coll = getCollection("notes");
+    expect(coll?.l0Source).toBe("p");
+    expect(loadConfig().models?.l0Source).toBe("n");
   });
 });

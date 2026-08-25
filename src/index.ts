@@ -65,6 +65,8 @@ import {
   type EmbedProgress,
   type EmbedResult,
   type ChunkStrategy,
+  type DocumentKind,
+  parseDocumentKind,
 } from "./store.js";
 import {
   LlamaCpp,
@@ -81,6 +83,7 @@ import {
   addContext as collectionsAddContext,
   removeContext as collectionsRemoveContext,
   setGlobalContext as collectionsSetGlobalContext,
+  getEffectiveL0Source,
   type Collection,
   type CollectionConfig,
   type NamedCollection,
@@ -109,13 +112,14 @@ export type {
   CollectionConfig,
   NamedCollection,
   ContextMap,
+  DocumentKind,
 };
 
 // Re-export the internal Store type for advanced consumers
 export type { InternalStore };
 
 // Re-export utility functions and types used by frontends
-export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
+export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES, parseDocumentKind };
 export type { ChunkStrategy } from "./store.js";
 
 // Re-export getDefaultDbPath for CLI/MCP that need the default database location
@@ -164,6 +168,8 @@ export interface SearchOptions {
   collections?: string[];
   /** Restrict to collection-relative path prefix(es) */
   pathPrefixes?: string[];
+  /** Restrict to file or dir-node hits (omit = both) */
+  kind?: DocumentKind;
   /** Max results (default: 10) */
   limit?: number;
   /** Minimum score threshold */
@@ -181,6 +187,7 @@ export interface LexSearchOptions {
   limit?: number;
   collection?: string;
   pathPrefixes?: string[];
+  kind?: DocumentKind;
 }
 
 /**
@@ -190,6 +197,7 @@ export interface VectorSearchOptions {
   limit?: number;
   collection?: string;
   pathPrefixes?: string[];
+  kind?: DocumentKind;
 }
 
 /**
@@ -434,6 +442,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         return structuredSearch(internal, opts.queries, {
           collections: collections.length > 0 ? collections : undefined,
           pathPrefixes: opts.pathPrefixes,
+          kind: opts.kind,
           limit: opts.limit,
           minScore: opts.minScore,
           explain: opts.explain,
@@ -447,6 +456,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return hybridQuery(internal, opts.query!, {
         collection: collections[0],
         pathPrefixes: opts.pathPrefixes,
+        kind: opts.kind,
         limit: opts.limit,
         minScore: opts.minScore,
         explain: opts.explain,
@@ -455,8 +465,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
-    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection, opts?.pathPrefixes),
-    searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection, undefined, undefined, opts?.pathPrefixes),
+    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection, opts?.pathPrefixes, opts?.kind),
+    searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection, undefined, undefined, opts?.pathPrefixes, opts?.kind),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
@@ -538,6 +548,11 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
                 });
               }
             : undefined,
+          resolveL0Source: (collectionName) => {
+            const config = loadConfig();
+            const coll = config.collections[collectionName];
+            return getEffectiveL0Source(coll, config);
+          },
         });
 
         return {
@@ -557,8 +572,11 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       let totalIndexed = 0, totalUpdated = 0, totalUnchanged = 0, totalRemoved = 0;
 
       for (const col of filtered) {
+        const config = loadConfig();
+        const yamlCol = config.collections[col.name];
         const result = await reindexCollection(internal, col.path, col.pattern || "**/*.md", col.name, {
           ignorePatterns: col.ignore,
+          l0Source: getEffectiveL0Source(yamlCol, config),
           onProgress: updateOpts?.onProgress
             ? (info) => updateOpts.onProgress!({ collection: col.name, ...info })
             : undefined,

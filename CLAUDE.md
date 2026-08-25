@@ -56,9 +56,15 @@ qmd mcp stop                      # Stop background MCP daemon
   qmd query "something" --path work/ --path personal/
   qmd search "keyword" --path docs/api/
   qmd vsearch "concept" -c mycollection --path archive/2024/
+  qmd query "folder name" --kind dir
+  qmd search "token" --kind file
   ```
 
+- **Kind filter** — `--kind file|dir` (not repeatable) restricts hits to files or dir-nodes at SQL level before RRF. Omit = mix. Invalid value → exit 1. `QMD_DIR_NODES=0` wins over `--kind dir` (empty). Works with `query`, `search`, `vsearch`, MCP `query`.
+
 - **Collection mask** — only paths matching the collection glob are indexed. Example: mask `**/*.{md,bsl}` excludes `*.xml` (e.g. 1C `Form.xml`); add `xml` to the mask and run `qmd update` if those files must be searchable.
+
+- **Dir-nodes** — `qmd update` builds a searchable L0 summary per directory with indexed files (`kind: dir` in query hits). Config `l0_source` on collection or `models`: `n` extractive (default), `p` read `{collectionRoot}/.qmd/l0/<relpath>.md`, `q` reserved (falls back to extractive). 1C dirs peek sibling `<Name>.xml` for Name/ru Synonym without indexing xml. `QMD_DIR_NODES=0` hides dir hits. `--kind file|dir` filters retrieval. Run `qmd update` then `qmd embed` after enabling.
 
 ## Collection Management
 
@@ -134,6 +140,7 @@ qmd multi-get "#abc123, #def456"
 # Search & retrieval
 -c, --collection <name>  # Restrict search to a collection (matches pwd suffix)
 --path <prefix>          # Restrict to collection-relative path prefix (repeatable, OR logic)
+--kind file|dir          # Restrict to files or dir-nodes (omit = both; QMD_DIR_NODES=0 hides dirs)
 -n <num>                 # Number of results
 --all                    # Return all matches
 --min-score <num>        # Minimum score threshold

@@ -115,7 +115,8 @@ export function searchResultsToJson(
     return {
       docid: `#${row.docid}`,
       score: Math.round(row.score * 100) / 100,
-      file: row.displayPath,
+      file: row.kind === "dir" ? `${row.displayPath}/` : row.displayPath,
+      ...(row.kind && row.kind !== "file" && { kind: row.kind }),
       ...(snippetInfo && { line: snippetInfo.line }),
       title: row.title,
       ...(row.context && { context: row.context }),

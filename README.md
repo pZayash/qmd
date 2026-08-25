@@ -291,6 +291,11 @@ await store.removeCollection("myapp")
 await store.renameCollection("old-name", "new-name")
 ```
 
+Directory **dir-nodes** (optional): set `l0Source: "p"` / YAML `l0_source: p` on a
+collection to use contract files at `.qmd/l0/<relpath>.md`; default `n` is extractive
+only. After `update`, run `embed`. Query hits include `kind: "dir"`. Set
+`QMD_DIR_NODES=0` to hide dir hits.
+
 #### Context
 
 Context adds descriptive metadata that improves search relevance and is returned alongside results:
@@ -706,6 +711,8 @@ qmd query "user authentication"
 # Search options
 -n <num>           # Number of results (default: 5, or 20 for --files/--json)
 -c, --collection   # Restrict search to a specific collection
+--path <prefix>    # Restrict to collection-relative path prefix (repeatable, OR)
+--kind file|dir    # Restrict to files or dir-nodes (omit = both)
 --all              # Return all matches (use with --min-score to filter)
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content

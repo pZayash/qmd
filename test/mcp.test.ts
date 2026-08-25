@@ -58,6 +58,7 @@ function initTestDatabase(db: Database): void {
       created_at TEXT NOT NULL,
       modified_at TEXT NOT NULL,
       active INTEGER NOT NULL DEFAULT 1,
+      kind TEXT NOT NULL DEFAULT 'file',
       FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE,
       UNIQUE(collection, path)
     )
@@ -92,6 +93,7 @@ function initTestDatabase(db: Database): void {
       kind TEXT NOT NULL,
       raw_target TEXT NOT NULL,
       anchor TEXT,
+      src_anchor TEXT,
       PRIMARY KEY (hash, seq),
       FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE
     )
@@ -105,12 +107,26 @@ function initTestDatabase(db: Database): void {
       dst_doc_id INTEGER,
       kind TEXT NOT NULL,
       raw_target TEXT NOT NULL,
+      anchor TEXT,
+      src_anchor TEXT,
       FOREIGN KEY (src_doc_id) REFERENCES documents(id) ON DELETE CASCADE
     )
   `);
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_edges_dst ON doc_edges(dst_doc_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_edges_src ON doc_edges(src_doc_id, collection)`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS doc_anchors (
+      doc_id INTEGER NOT NULL,
+      collection TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      ord INTEGER NOT NULL,
+      PRIMARY KEY (doc_id, slug, ord)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_doc_anchors_lookup ON doc_anchors(doc_id, slug)`);
 
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
@@ -966,7 +982,7 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
 
   beforeAll(async () => {
     // Create isolated test database with seeded data
-    httpTestDbPath = `/tmp/qmd-mcp-http-test-${Date.now()}.sqlite`;
+    httpTestDbPath = join(tmpdir(), `qmd-mcp-http-test-${Date.now()}.sqlite`);
     const db = openDatabase(httpTestDbPath);
     initTestDatabase(db);
     seedTestData(db);

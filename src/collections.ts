@@ -9,6 +9,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
 import YAML from "yaml";
+import { resolveL0Source, type L0Source } from "./dir-node.js";
+
+export type { L0Source } from "./dir-node.js";
 
 // ============================================================================
 // Types
@@ -31,6 +34,7 @@ export interface Collection {
   context?: ContextMap;      // Optional context definitions
   update?: string;           // Optional bash command to run during qmd update
   includeByDefault?: boolean; // Include in queries by default (default: true)
+  l0Source?: L0Source;       // Dir-node L0 mode: n=extractive, p=contract, q=reserved
 }
 
 /**
@@ -40,6 +44,7 @@ export interface ModelsConfig {
   embed?: string;
   rerank?: string;
   generate?: string;
+  l0Source?: L0Source;       // Default dir-node L0 mode for collections without override
   embedBatchSize?: number;
   // Local OpenAI-compatible fallback for a cloud `embed` provider (e.g. LMStudio).
   // Used when the cloud endpoint is unreachable (network error / 5xx). The local
@@ -72,6 +77,34 @@ export interface CollectionConfig {
  */
 export interface NamedCollection extends Collection {
   name: string;
+}
+
+type CollectionYaml = Collection & { l0_source?: unknown };
+
+/** Normalize YAML snake_case keys onto Collection fields. */
+export function normalizeCollectionFields(collection: CollectionYaml): Collection {
+  const l0Raw = collection.l0Source ?? collection.l0_source;
+  const { l0_source: _drop, ...rest } = collection;
+  if (l0Raw === undefined) return rest;
+  return { ...rest, l0Source: resolveL0Source(l0Raw) };
+}
+
+/** Effective dir-node L0 mode: collection overrides models; default `n`. */
+export function getEffectiveL0Source(
+  collection?: Collection | NamedCollection | null,
+  config?: CollectionConfig,
+): L0Source {
+  if (collection) {
+    const c = collection as CollectionYaml;
+    if (c.l0Source !== undefined) return resolveL0Source(c.l0Source);
+    if (c.l0_source !== undefined) return resolveL0Source(c.l0_source);
+  }
+  if (config?.models) {
+    const m = config.models as ModelsConfig & { l0_source?: unknown };
+    if (m.l0Source !== undefined) return resolveL0Source(m.l0Source);
+    if (m.l0_source !== undefined) return resolveL0Source(m.l0_source);
+  }
+  return "n";
 }
 
 // ============================================================================
@@ -286,7 +319,7 @@ export function getCollection(name: string): NamedCollection | null {
     return null;
   }
 
-  return { name, ...collection };
+  return { name, ...normalizeCollectionFields(collection as CollectionYaml) };
 }
 
 /**
@@ -296,7 +329,7 @@ export function listCollections(): NamedCollection[] {
   const config = loadConfig();
   return Object.entries(config.collections).map(([name, collection]) => ({
     name,
-    ...collection,
+    ...normalizeCollectionFields(collection as CollectionYaml),
   }));
 }
 
