@@ -11,6 +11,8 @@ import {
   resolveL0Source,
   parseDocumentKind,
   namedChildExpansion,
+  listIndexedChildren,
+  MAX_LS_CHILDREN,
 } from "../src/dir-node.js";
 
 describe("dir-node helpers", () => {
@@ -93,6 +95,28 @@ describe("dir-node helpers", () => {
       extFiles: ["ManagerModule.bsl", "ObjectModule.bsl"],
       formDirs: ["ФормаДокумента"],
     });
+  });
+
+  test("listIndexedChildren is one level: file plus child dir, not grandchild", () => {
+    const files = ["docs/ai/one.md", "docs/ai/sub/two.md"];
+    const listing = listIndexedChildren(files, "docs/ai");
+    expect(listing.childFiles.map(f => f.basename)).toEqual(["one.md"]);
+    expect(listing.childDirs).toEqual(["sub"]);
+    expect(listing.truncated).toBe(false);
+    expect(listing.omitted).toBe(0);
+  });
+
+  test("listIndexedChildren caps at 200 with omitted count", () => {
+    const files = [
+      ...Array.from({ length: 150 }, (_, i) => `root/dir-${String(i).padStart(3, "0")}/x.md`),
+      ...Array.from({ length: 80 }, (_, i) => `root/file-${String(i).padStart(3, "0")}.md`),
+    ];
+    const listing = listIndexedChildren(files, "root");
+    expect(listing.childDirs.length + listing.childFiles.length).toBe(MAX_LS_CHILDREN);
+    expect(listing.truncated).toBe(true);
+    expect(listing.omitted).toBe(30);
+    expect(listing.childDirs.length).toBe(150);
+    expect(listing.childFiles.length).toBe(50);
   });
 
   test("peek1cXml reads Name and ru Synonym", () => {

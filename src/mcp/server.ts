@@ -42,8 +42,11 @@ import {
   getBacklinks,
   getDanglingEdges,
   isDocid,
+  parseVirtualPath,
+  getActiveFileDocumentPaths,
 } from "../store.js";
 import { slugifyAnchor } from "../links.js";
+import { listIndexedChildren } from "../dir-node.js";
 import {
   searchResultsToJson,
   searchResultsToCsv,
@@ -102,6 +105,28 @@ function normalizePathPrefixes(raw?: string[]): string[] | undefined {
     .map(p => p.replace(/\\/g, "/").replace(/^\//, ""))
     .filter(p => p.length > 0);
   return out.length > 0 ? out : undefined;
+}
+
+/** CLI `qmd ls` path: `qmd://col/rel` or `col[/rel]`. Empty → collections listing. */
+function parseIndexLsPath(raw: string): { collectionName: string; dirRelPath: string } | { error: string } {
+  const trimmed = raw.trim().replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!trimmed) return { error: "empty path" };
+  if (trimmed.startsWith("qmd://")) {
+    const parsed = parseVirtualPath(trimmed);
+    if (!parsed) return { error: `Invalid virtual path: ${raw}` };
+    return {
+      collectionName: parsed.collectionName,
+      dirRelPath: parsed.path.replace(/\/+$/, ""),
+    };
+  }
+  const slash = trimmed.indexOf("/");
+  if (slash === -1) {
+    return { collectionName: trimmed, dirRelPath: "" };
+  }
+  return {
+    collectionName: trimmed.slice(0, slash),
+    dirRelPath: trimmed.slice(slash + 1).replace(/\/+$/, ""),
+  };
 }
 
 /**
@@ -189,6 +214,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
   lines.push("Retrieval:");
   lines.push("  - `get` — single document by path or docid (#abc123). Supports line offset (`file.md:100`).");
   lines.push("  - `multi_get` — batch retrieve by glob (`journals/2025-05*.md`) or comma-separated list.");
+  lines.push("  - `ls` — one-level browse of indexed children (or collections if path omitted). Not search; not drill.");
   lines.push("  - `links` — 1-hop out-links, backlinks, and dangling edges for a document.");
 
   // --- Non-obvious things that prevent mistakes ---
@@ -335,7 +361,7 @@ Intent-aware lex (C++ performance, not sports):
 
 ## Agent drill
 
-After a \`kind: dir\` hit: \`get\` the dir-node L0, then \`query\` again with \`path: ["<dirpath>/"]\` (trailing slash) and typically \`kind: "file"\`. Same tools — no \`drill\` / \`ls\` command. Trailing \`/\` is the caller's job so sibling names are not prefix-matched.`,
+After a \`kind: dir\` hit: \`get\` the dir-node L0, then \`query\` again with \`path: ["<dirpath>/"]\` (trailing slash) and typically \`kind: "file"\`. Drill is search, not \`ls\`. \`ls\` is one-level index browse. Trailing \`/\` is the caller's job so sibling names are not prefix-matched.`,
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
         searches: z.array(subSearchSchema).min(1).max(10).describe(
@@ -620,6 +646,79 @@ After a \`kind: dir\` hit: \`get\` the dir-node L0, then \`query\` again with \`
         payload.dangling = getOutEdges(db, docId).filter(e => e.dstDocId === null);
       }
 
+      return {
+        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+        structuredContent: payload,
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // Tool: ls (one-level indexed browse)
+  // ---------------------------------------------------------------------------
+
+  server.registerTool(
+    "ls",
+    {
+      title: "List indexed children",
+      description:
+        "Browse one level of indexed files and folders (dir-nodes implied by file paths). " +
+        "Omit path to list collections. Path is one string like CLI `qmd ls`: `qmd://col/rel` or `col[/rel]`. " +
+        "Not search and not agent drill (drill = get L0 then query with path+/ and kind file). " +
+        "Cap 200 children; truncated if more. CLI `qmd ls` still dumps all files under a prefix.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        path: z.string().optional().describe(
+          "Collection or folder: omit for collections; `qmd://name/prefix` or `name/prefix`"
+        ),
+      },
+    },
+    async ({ path: pathArg }) => {
+      const collections = await store.listCollections();
+      if (!pathArg?.trim()) {
+        const listing = collections.map(c => ({ name: c.name, docs: c.active_count }));
+        const payload = { collections: listing, truncated: false, omitted: 0 };
+        return {
+          content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+          structuredContent: payload,
+        };
+      }
+
+      const parsed = parseIndexLsPath(pathArg);
+      if ("error" in parsed) {
+        return { content: [{ type: "text", text: parsed.error }], isError: true };
+      }
+
+      const col = collections.find(c => c.name === parsed.collectionName);
+      if (!col) {
+        return {
+          content: [{ type: "text", text: `Collection not found: ${parsed.collectionName}` }],
+          isError: true,
+        };
+      }
+
+      const filePaths = getActiveFileDocumentPaths(store.internal.db, parsed.collectionName);
+      const listing = listIndexedChildren(filePaths, parsed.dirRelPath);
+      const prefix = parsed.dirRelPath;
+      const entries: { name: string; path: string; kind: "file" | "dir" }[] = [
+        ...listing.childDirs.map(name => ({
+          name,
+          path: prefix ? `${prefix}/${name}` : name,
+          kind: "dir" as const,
+        })),
+        ...listing.childFiles.map(f => ({
+          name: f.basename,
+          path: f.path,
+          kind: "file" as const,
+        })),
+      ];
+      const payload = {
+        collection: parsed.collectionName,
+        path: prefix,
+        entries,
+        truncated: listing.truncated,
+        omitted: listing.omitted,
+      };
       return {
         content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
         structuredContent: payload,

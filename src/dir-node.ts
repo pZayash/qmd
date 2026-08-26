@@ -278,6 +278,36 @@ export function getDirectChildren(
   };
 }
 
+export const MAX_LS_CHILDREN = 200;
+
+export type IndexedChildrenListing = {
+  childDirs: string[];
+  childFiles: { path: string; basename: string }[];
+  truncated: boolean;
+  omitted: number;
+};
+
+/** One-level indexed children; dirs first; cap MAX_LS_CHILDREN. */
+export function listIndexedChildren(
+  filePaths: string[],
+  dirRelPath: string,
+): IndexedChildrenListing {
+  const { childDirs, childFiles } = getDirectChildren(filePaths, dirRelPath);
+  const total = childDirs.length + childFiles.length;
+  if (total <= MAX_LS_CHILDREN) {
+    return { childDirs, childFiles, truncated: false, omitted: 0 };
+  }
+  const omitted = total - MAX_LS_CHILDREN;
+  const dirsKeep = Math.min(childDirs.length, MAX_LS_CHILDREN);
+  const filesKeep = MAX_LS_CHILDREN - dirsKeep;
+  return {
+    childDirs: childDirs.slice(0, dirsKeep),
+    childFiles: childFiles.slice(0, filesKeep),
+    truncated: true,
+    omitted,
+  };
+}
+
 export function dirHasIndexedFiles(filePaths: string[], dirRelPath: string): boolean {
   const prefix = `${dirRelPath}/`;
   return filePaths.some(fp => fp.startsWith(prefix));

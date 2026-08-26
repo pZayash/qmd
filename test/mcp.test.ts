@@ -1121,6 +1121,56 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(toolNames).toContain("query");
     expect(toolNames).toContain("get");
     expect(toolNames).toContain("status");
+    expect(toolNames).toContain("ls");
+  });
+
+  test("POST /mcp tools/call ls without path lists collections", async () => {
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 8, method: "tools/call",
+      params: { name: "ls", arguments: {} },
+    });
+    expect(status).toBe(200);
+    const text = json.result.content?.[0]?.text ?? "";
+    expect(text).toContain("docs");
+    expect(json.result.isError).toBeFalsy();
+  });
+
+  test("POST /mcp tools/call ls unknown collection is error", async () => {
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 9, method: "tools/call",
+      params: { name: "ls", arguments: { path: "no-such-collection" } },
+    });
+    expect(status).toBe(200);
+    expect(json.result.isError).toBe(true);
+    const text = json.result.content?.[0]?.text ?? "";
+    expect(text.toLowerCase()).toMatch(/not found|collection/);
+  });
+
+  test("POST /mcp tools/call ls path docs is one level", async () => {
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 10, method: "tools/call",
+      params: { name: "ls", arguments: { path: "docs" } },
+    });
+    expect(status).toBe(200);
+    expect(json.result.isError).toBeFalsy();
+    const payload = JSON.parse(json.result.content?.[0]?.text ?? "{}");
+    const names = (payload.entries ?? []).map((e: { name: string }) => e.name);
+    expect(names).toContain("meetings");
+    expect(names).toContain("readme.md");
+    expect(names).toContain("api.md");
+    expect(names).not.toContain("meeting-2024-01.md");
   });
 
   test("POST /mcp tools/call query returns results", async () => {

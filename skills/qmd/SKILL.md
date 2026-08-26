@@ -118,13 +118,14 @@ Omit to search all collections.
 
 ### Agent drill
 
-After a `kind: dir` hit: `get` the dir-node (L0 body), then `query` with `path: ["<dirpath>/"]` (trailing slash) and typically `kind: "file"`. No `drill` command. Trailing `/` is required so sibling names are not prefix-matched.
+After a `kind: dir` hit: `get` the dir-node (L0 body), then `query` with `path: ["<dirpath>/"]` (trailing slash) and typically `kind: "file"`. No `drill` command. Trailing `/` is required so sibling names are not prefix-matched. `ls` is one-level index browse, not a substitute for this query.
 
 ## Other MCP Tools
 
 | Tool | Use |
 |------|-----|
 | `get` | Retrieve doc by path or `#docid` |
+| `ls` | One-level indexed children (omit path = collections). Not drill. |
 | `multi_get` | Retrieve multiple by glob/list |
 | `status` | Collections and health |
 

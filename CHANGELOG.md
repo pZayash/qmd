@@ -21,6 +21,10 @@
 - REST `POST /query` (alias `/search`) accepts the same `path` / `kind` and returns
   `kind` on each hit (dir `file` ends with `/`). Invalid `kind` or non-array `path`
   is HTTP 400. Restart the HTTP MCP daemon to pick up the handler.
+- MCP `ls`: one-level browse of indexed children (files + folder names from
+  path prefixes). Omit `path` to list collections. Cap 200 with truncation.
+  Not search and not agent drill. CLI `qmd ls` still dumps all files under a
+  prefix. Restart MCP daemon to pick up the tool.
 
 - Added: `QMD_EMBED_CONCURRENCY` for parallel OpenRouter embedding with 429
   backoff and abort propagation (local llama path unchanged).

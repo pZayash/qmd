@@ -80,6 +80,7 @@ Although the tool works perfectly fine when you just tell your agent to use it o
 **Tools exposed:**
 - `query` — Search with typed sub-queries (`lex`/`vec`/`hyde`), combined via RRF + reranking
 - `get` — Retrieve a document by path or docid (with fuzzy matching suggestions)
+- `ls` — One-level indexed browse (omit path = collections). Not search; not drill
 - `multi_get` — Batch retrieve by glob pattern, comma-separated list, or docids
 - `links` — 1-hop out-links, backlinks, and dangling edges for a document
 - `status` — Index health and collection info
@@ -713,7 +714,7 @@ qmd query "user authentication"
 -c, --collection   # Restrict search to a specific collection
 --path <prefix>    # Restrict to collection-relative path prefix (repeatable, OR)
 --kind file|dir    # Restrict to files or dir-nodes (omit = both)
-# MCP query also takes path: ["prefix/"] (OR) — drill: get dir L0, then path+kind file
+# MCP query path: ["prefix/"] (OR) — drill: get dir L0, then path+kind file. MCP ls is browse, not drill
 --all              # Return all matches (use with --min-score to filter)
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content
