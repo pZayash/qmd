@@ -67,7 +67,7 @@ qmd mcp stop                      # Stop background MCP daemon
 
 - **Collection mask** — only paths matching the collection glob are indexed. Example: mask `**/*.{md,bsl}` excludes `*.xml` (e.g. 1C `Form.xml`); add `xml` to the mask and run `qmd update` if those files must be searchable.
 
-- **Dir-nodes** — `qmd update` builds a searchable L0 summary per directory with indexed files (`kind: dir` in query hits). Config `l0_source` on collection or `models`: `n` extractive (default), `p` read `{collectionRoot}/.qmd/l0/<relpath>.md`, `q` reserved (falls back to extractive). 1C dirs peek sibling `<Name>.xml` for Name/ru Synonym without indexing xml. `QMD_DIR_NODES=0` hides dir hits. `--kind file|dir` filters retrieval. Run `qmd update` then `qmd embed` after enabling.
+- **Dir-nodes** — `qmd update` builds a searchable L0 summary per directory with indexed files (`kind: dir` in query hits). Config `l0_source` on collection or `models`: `n` extractive (default), `p` read `{collectionRoot}/.qmd/l0/<relpath>.md`, `q` reserved (falls back to extractive). 1C dirs peek sibling `<Name>.xml` for Name/ru Synonym without indexing xml. Extractive L0 also lists `Ext` file basenames and `Forms` child dir names. `QMD_DIR_NODES=0` hides dir hits. `--kind file|dir` filters retrieval. Run `qmd update` then `qmd embed` after enabling.
 
 ## Collection Management
 

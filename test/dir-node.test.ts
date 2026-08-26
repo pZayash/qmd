@@ -10,6 +10,7 @@ import {
   readContractL0,
   resolveL0Source,
   parseDocumentKind,
+  namedChildExpansion,
 } from "../src/dir-node.js";
 
 describe("dir-node helpers", () => {
@@ -35,6 +36,63 @@ describe("dir-node helpers", () => {
     expect(text).toContain("40 files");
     expect(text).toContain("dirs: sub");
     expect(text).toContain("+9 more");
+  });
+
+  test("buildExtractiveL0 lists Ext files and Forms dirs for 1C-shaped input", () => {
+    const text = buildExtractiveL0({
+      dirRelPath: "conf/Documents/ЗаказПокупателя",
+      xmlPeek: { name: "Document.ЗаказПокупателя", synonym: "Заказ покупателя" },
+      childDirs: ["Commands", "Ext", "Forms", "Templates"],
+      childFiles: [],
+      extFiles: ["ManagerModule.bsl", "ObjectModule.bsl"],
+      formDirs: ["ФормаДокумента", "ФормаСписка"],
+    });
+    expect(text).toContain("Ext: ManagerModule.bsl, ObjectModule.bsl");
+    expect(text).toContain("Forms: ФормаДокумента, ФормаСписка");
+    expect(text).toContain("dirs: Commands, Ext, Forms, Templates");
+  });
+
+  test("buildExtractiveL0 omits Ext/Forms lines for markdown-only folders", () => {
+    const text = buildExtractiveL0({
+      dirRelPath: "docs/ai",
+      childDirs: ["sub"],
+      childFiles: [{ basename: "readme.md", heading: "Readme" }],
+    });
+    expect(text).toContain("readme.md — Readme");
+    expect(text).not.toMatch(/^Ext:/m);
+    expect(text).not.toContain("Ext:");
+    expect(text).not.toContain("Forms:");
+  });
+
+  test("buildExtractiveL0 drops whole form names under 500 chars", () => {
+    const formDirs = Array.from({ length: 40 }, (_, i) =>
+      `ФормаОченьДлинноеИмяДляПроверкиБюджета${String(i).padStart(3, "0")}`,
+    );
+    const naive = `obj\nForms: ${formDirs.join(", ")}`;
+    expect(naive.length).toBeGreaterThan(500);
+    const text = buildExtractiveL0({
+      dirRelPath: "obj",
+      childDirs: [],
+      childFiles: [],
+      formDirs,
+    });
+    expect(text.length).toBeLessThanOrEqual(500);
+    expect(text).toContain("+");
+    expect(text).toMatch(/\+\d+ more$/);
+    expect(text.endsWith("...")).toBe(false);
+  });
+
+  test("namedChildExpansion reads Ext files and Forms dirs, not Commands", () => {
+    const files = [
+      "obj/Ext/ManagerModule.bsl",
+      "obj/Ext/ObjectModule.bsl",
+      "obj/Forms/ФормаДокумента/Module.bsl",
+      "obj/Commands/X/Ext/CommandModule.bsl",
+    ];
+    expect(namedChildExpansion(files, "obj")).toEqual({
+      extFiles: ["ManagerModule.bsl", "ObjectModule.bsl"],
+      formDirs: ["ФормаДокумента"],
+    });
   });
 
   test("peek1cXml reads Name and ru Synonym", () => {

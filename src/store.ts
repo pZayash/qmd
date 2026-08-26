@@ -44,6 +44,7 @@ import {
   collectDirPathsFromFiles,
   dirHasIndexedFiles,
   getDirectChildren,
+  namedChildExpansion,
   peek1cXml,
   readContractL0,
   readFirstMarkdownHeading,
@@ -1760,6 +1761,7 @@ async function upsertDirNode(
   now: string,
 ): Promise<"indexed" | "updated" | "unchanged"> {
   const { childDirs, childFiles } = getDirectChildren(filePaths, dirRelPath);
+  const { extFiles, formDirs } = namedChildExpansion(filePaths, dirRelPath);
   const pathContext = pathContextLookup(dirRelPath);
   const xmlPeek = peek1cXml(xmlPathForDir(collectionPath, dirRelPath));
   const extractive = buildExtractiveL0({
@@ -1771,6 +1773,8 @@ async function upsertDirNode(
       basename: f.basename,
       heading: readFirstMarkdownHeading(collectionPath, f.path),
     })),
+    extFiles,
+    formDirs,
   });
   const contract = readContractL0(collectionPath, dirRelPath);
   const l0Text = chooseL0Text({ source: l0Source, contract, extractive });

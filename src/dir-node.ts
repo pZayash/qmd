@@ -10,6 +10,7 @@ export type DocumentKind = "file" | "dir";
 
 const MAX_XML_BYTES = 64 * 1024;
 const MAX_LISTED_NAMES = 32;
+const MAX_L0_CHARS = 500;
 
 export function resolveL0Source(raw: unknown): L0Source {
   if (raw === "n" || raw === "p" || raw === "q") return raw;
@@ -88,59 +89,119 @@ export type ExtractiveL0Input = {
   xmlPeek?: { name: string; synonym: string } | null;
   childDirs: string[];
   childFiles: { basename: string; heading?: string }[];
+  extFiles?: string[];
+  formDirs?: string[];
 };
 
-/** Deterministic L0 from direct children only; cap 32 names with "+N more". */
-export function buildExtractiveL0(input: ExtractiveL0Input): string {
-  const lines: string[] = [input.dirRelPath];
+function l0Fits(lines: string[], addition: string): boolean {
+  const cur = lines.length === 0 ? 0 : lines.join("\n").length;
+  const extra = cur === 0 ? addition.length : 1 + addition.length;
+  return cur + extra <= MAX_L0_CHARS;
+}
 
-  if (input.pathContext?.trim()) {
-    lines.push(input.pathContext.trim());
+function l0PushLine(lines: string[], line: string): boolean {
+  if (!l0Fits(lines, line)) return false;
+  lines.push(line);
+  return true;
+}
+
+/** Push `prefix + names` as one comma line. Returns how many names did not fit. */
+function l0PushCommaLine(lines: string[], prefix: string, names: string[]): number {
+  if (names.length === 0) return 0;
+  const included: string[] = [];
+  for (const name of names) {
+    const candidate = `${prefix}${[...included, name].join(", ")}`;
+    if (!l0Fits(lines, candidate)) break;
+    included.push(name);
   }
+  if (included.length === 0) return names.length;
+  lines.push(`${prefix}${included.join(", ")}`);
+  return names.length - included.length;
+}
 
+/** Deterministic L0: named-child expansion then leftover directs; 32 leftover names; 500 chars. */
+export function buildExtractiveL0(input: ExtractiveL0Input): string {
+  const lines: string[] = [];
+  let overflow = 0;
+  const extFiles = input.extFiles ?? [];
+  const formDirs = input.formDirs ?? [];
+
+  l0PushLine(lines, input.dirRelPath);
+  if (input.pathContext?.trim()) {
+    l0PushLine(lines, input.pathContext.trim());
+  }
   if (input.xmlPeek) {
     const { name, synonym } = input.xmlPeek;
-    lines.push(synonym ? `${name} — ${synonym}` : name);
+    l0PushLine(lines, synonym ? `${name} — ${synonym}` : name);
   }
 
-  const totalNames = input.childDirs.length + input.childFiles.length;
+  overflow += l0PushCommaLine(lines, "Ext: ", extFiles);
+  overflow += l0PushCommaLine(lines, "Forms: ", formDirs);
+
   if (input.childFiles.length > 0) {
-    lines.push(`${input.childFiles.length} file${input.childFiles.length === 1 ? "" : "s"}`);
+    const count = `${input.childFiles.length} file${input.childFiles.length === 1 ? "" : "s"}`;
+    l0PushLine(lines, count);
   }
 
   let shown = 0;
-  let overflow = 0;
-
-  if (input.childDirs.length > 0) {
-    const slice = input.childDirs.slice(0, MAX_LISTED_NAMES - shown);
-    shown += slice.length;
-    overflow += input.childDirs.length - slice.length;
-    lines.push(`dirs: ${slice.join(", ")}`);
+  const dirIncluded: string[] = [];
+  for (let i = 0; i < input.childDirs.length; i++) {
+    if (shown >= MAX_LISTED_NAMES) {
+      overflow += input.childDirs.length - i;
+      break;
+    }
+    const candidate = `dirs: ${[...dirIncluded, input.childDirs[i]].join(", ")}`;
+    if (!l0Fits(lines, candidate)) {
+      overflow += input.childDirs.length - i;
+      break;
+    }
+    dirIncluded.push(input.childDirs[i]!);
+    shown++;
+  }
+  if (dirIncluded.length > 0) {
+    lines.push(`dirs: ${dirIncluded.join(", ")}`);
   }
 
-  for (const file of input.childFiles) {
+  for (let i = 0; i < input.childFiles.length; i++) {
     if (shown >= MAX_LISTED_NAMES) {
-      overflow++;
-      continue;
+      overflow += input.childFiles.length - i;
+      break;
     }
+    const file = input.childFiles[i]!;
     const line = file.heading?.trim()
       ? `${file.basename} — ${file.heading.trim()}`
       : file.basename;
-    lines.push(line);
+    if (!l0PushLine(lines, line)) {
+      overflow += input.childFiles.length - i;
+      break;
+    }
     shown++;
   }
 
   if (overflow > 0) {
-    lines.push(`+${overflow} more`);
-  } else if (totalNames > MAX_LISTED_NAMES) {
-    lines.push(`+${totalNames - MAX_LISTED_NAMES} more`);
+    l0PushLine(lines, `+${overflow} more`);
   }
 
-  let text = lines.join("\n");
-  if (text.length > 500) {
-    text = text.slice(0, 497) + "...";
+  return lines.join("\n");
+}
+
+/** Indexed-path expansion for exact child dirs `Ext` (files) and `Forms` (child dirs). */
+export function namedChildExpansion(
+  filePaths: string[],
+  dirRelPath: string,
+): { extFiles: string[]; formDirs: string[] } {
+  const { childDirs } = getDirectChildren(filePaths, dirRelPath);
+  const extFiles: string[] = [];
+  const formDirs: string[] = [];
+  if (childDirs.includes("Ext")) {
+    const extPath = dirRelPath ? `${dirRelPath}/Ext` : "Ext";
+    extFiles.push(...getDirectChildren(filePaths, extPath).childFiles.map(f => f.basename));
   }
-  return text;
+  if (childDirs.includes("Forms")) {
+    const formsPath = dirRelPath ? `${dirRelPath}/Forms` : "Forms";
+    formDirs.push(...getDirectChildren(filePaths, formsPath).childDirs);
+  }
+  return { extFiles, formDirs };
 }
 
 /** Shadow contract: `{collectionRoot}/.qmd/l0/{dirRelPath}.md` */

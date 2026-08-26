@@ -8,6 +8,8 @@
   that contains indexed files; `qmd query` / FTS / vec can return `kind: dir` hits.
   Config `l0_source`: `n` (extractive only) or `p` (read `.qmd/l0/<relpath>.md` when
   present). For 1C object dirs, peek sibling `*.xml` Name + ru Synonym (xml not indexed).
+  Extractive L0 also lists `Ext:` indexed files and `Forms:` child dir names (named-child
+  expansion); 500-char cap drops whole names (`+N more`), not a mid-name slice.
   Kill switch: `QMD_DIR_NODES=0` omits dir hits from query. After upgrade run
   `qmd update` then `qmd embed`. `l0_source: q` is reserved (no API generate yet).
 - `--kind file|dir` on `qmd search` / `vsearch` / `query` and MCP `query`: hard SQL

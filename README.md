@@ -293,8 +293,8 @@ await store.renameCollection("old-name", "new-name")
 
 Directory **dir-nodes** (optional): set `l0Source: "p"` / YAML `l0_source: p` on a
 collection to use contract files at `.qmd/l0/<relpath>.md`; default `n` is extractive
-only. After `update`, run `embed`. Query hits include `kind: "dir"`. Set
-`QMD_DIR_NODES=0` to hide dir hits.
+only (direct children plus `Ext` files / `Forms` dir names). After `update`, run
+`embed`. Query hits include `kind: "dir"`. Set `QMD_DIR_NODES=0` to hide dir hits.
 
 #### Context
 
