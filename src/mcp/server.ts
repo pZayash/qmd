@@ -1088,6 +1088,23 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           return;
         }
 
+        if (params.path !== undefined && !Array.isArray(params.path)) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "path must be an array of prefix strings" }));
+          return;
+        }
+
+        let kind: "file" | "dir" | undefined;
+        if (params.kind !== undefined && params.kind !== null && params.kind !== "") {
+          try {
+            kind = parseDocumentKind(String(params.kind));
+          } catch (err) {
+            nodeRes.writeHead(400, { "Content-Type": "application/json" });
+            nodeRes.end(JSON.stringify({ error: err instanceof Error ? err.message : "Invalid kind" }));
+            return;
+          }
+        }
+
         // Map to internal format
         const queries: ExpandedQuery[] = params.searches.map((s: any) => ({
           type: s.type as 'lex' | 'vec' | 'hyde',
@@ -1100,9 +1117,12 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         const results = await store.search({
           queries,
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+          pathPrefixes: normalizePathPrefixes(params.path),
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
           intent: params.intent,
+          kind,
+          ...(typeof params.rerank === "boolean" ? { rerank: params.rerank } : {}),
         });
 
         // Use first lex or vec query for snippet extraction
@@ -1114,11 +1134,12 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300);
           return {
             docid: `#${r.docid}`,
-            file: r.displayPath,
+            file: r.kind === "dir" ? `${r.displayPath}/` : r.displayPath,
             title: r.title,
             score: Math.round(r.score * 100) / 100,
             context: r.context,
             snippet: addLineNumbers(snippet, line),
+            kind: r.kind,
           };
         });
 

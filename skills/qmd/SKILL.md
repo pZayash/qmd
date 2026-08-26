@@ -148,8 +148,10 @@ qmd multi-get notes/foo.md,notes/bar.md   # Comma-separated list, preserves orde
 ```bash
 curl -X POST http://localhost:8181/query \
   -H "Content-Type: application/json" \
-  -d '{"searches": [{"type": "lex", "query": "test"}]}'
+  -d '{"searches":[{"type":"lex","query":"test"}],"path":["docs/ai/"],"kind":"file"}'
 ```
+
+`path` is a string array (OR prefixes, same as MCP). `kind` is `file` or `dir`. Hits include `kind`; dir `file` ends with `/`. Invalid `kind` or non-array `path` → 400.
 
 ## Setup
 

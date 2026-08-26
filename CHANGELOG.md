@@ -18,6 +18,9 @@
 - MCP `query.path` (`string[]`, OR prefixes, same as CLI `--path`) so agents can
   drill: `get` dir L0, then query with `path: ["dirpath/"]` and `kind: "file"`.
   No auto-slash; no new `drill` tool. Restart MCP daemon to pick up the schema.
+- REST `POST /query` (alias `/search`) accepts the same `path` / `kind` and returns
+  `kind` on each hit (dir `file` ends with `/`). Invalid `kind` or non-array `path`
+  is HTTP 400. Restart the HTTP MCP daemon to pick up the handler.
 
 - Added: `QMD_EMBED_CONCURRENCY` for parallel OpenRouter embedding with 429
   backoff and abort propagation (local llama path unchanged).

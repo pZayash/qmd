@@ -1166,6 +1166,56 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(text.toLowerCase()).not.toContain("readme.md");
   });
 
+  test("POST /query path and kind file scopes hits", async () => {
+    const res = await fetch(`${baseUrl}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        searches: [{ type: "lex", query: "meeting" }],
+        path: ["meetings/"],
+        kind: "file",
+        rerank: false,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(Array.isArray(body.results)).toBe(true);
+    expect(body.results.length).toBeGreaterThan(0);
+    expect(body.results.every((r: { kind: string }) => r.kind === "file")).toBe(true);
+    expect(body.results.every((r: { file: string }) => r.file.toLowerCase().includes("meetings/"))).toBe(true);
+    expect(body.results.some((r: { file: string }) => r.file.toLowerCase().includes("readme.md"))).toBe(false);
+  });
+
+  test("POST /query invalid kind is 400", async () => {
+    const res = await fetch(`${baseUrl}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        searches: [{ type: "lex", query: "meeting" }],
+        kind: "both",
+        rerank: false,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBeTruthy();
+  });
+
+  test("POST /query path string not array is 400", async () => {
+    const res = await fetch(`${baseUrl}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        searches: [{ type: "lex", query: "meeting" }],
+        path: "meetings/",
+        rerank: false,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBeTruthy();
+  });
+
   test("POST /mcp tools/call get returns document", async () => {
     // Initialize
     await mcpRequest({
