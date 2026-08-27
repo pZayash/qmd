@@ -8,8 +8,9 @@
   that contains indexed files; `qmd query` / FTS / vec can return `kind: dir` hits.
   Config `l0_source`: `n` (extractive only) or `p` (read `.qmd/l0/<relpath>.md` when
   present). For 1C object dirs, peek sibling `*.xml` Name + ru Synonym (xml not indexed).
-  Extractive L0 also lists `Ext:` indexed files and `Forms:` child dir names (named-child
-  expansion); 500-char cap drops whole names (`+N more`), not a mid-name slice.
+  Extractive L0 also lists `Ext:` indexed files and `Forms:` / `Commands:` /
+  `Templates:` child dir names (named-child expansion); 500-char cap drops whole
+  names (`+N more`), not a mid-name slice.
   Kill switch: `QMD_DIR_NODES=0` omits dir hits from query. After upgrade run
   `qmd update` then `qmd embed`. `l0_source: q` is reserved (no API generate yet).
 - `--kind file|dir` on `qmd search` / `vsearch` / `query` and MCP `query`: hard SQL
@@ -29,6 +30,9 @@
   contracts (one dir, or `--all` for a collection). Skips non-empty files.
   Not MCP. Not part of `qmd update`. If `l0_source` is `n`, still writes and
   warns. Then run `qmd update` and `qmd embed` (not automatic).
+- `qmd update` prints `Dir-nodes: n/m` on TTY after file indexing so the L0
+  rebuild is not a silent pause. SDK `onProgress` includes `phase: "file" | "dir"`
+  (ETA resets when the phase changes).
 
 - Added: `QMD_EMBED_CONCURRENCY` for parallel OpenRouter embedding with 429
   backoff and abort propagation (local llama path unchanged).

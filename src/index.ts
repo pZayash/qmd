@@ -61,6 +61,7 @@ import {
   type IndexHealthInfo,
   type SearchHooks,
   type ReindexProgress,
+  type ReindexPhase,
   type ReindexResult,
   type EmbedProgress,
   type EmbedResult,
@@ -105,6 +106,7 @@ export type {
   IndexHealthInfo,
   SearchHooks,
   ReindexProgress,
+  ReindexPhase,
   ReindexResult,
   EmbedProgress,
   EmbedResult,
@@ -129,13 +131,15 @@ export { getDefaultDbPath } from "./store.js";
 export { Maintenance } from "./maintenance.js";
 
 /**
- * Progress info emitted during update() for each file processed.
+ * Progress info emitted during update() for each file or dir-node processed.
  */
 export type UpdateProgress = {
   collection: string;
   file: string;
   current: number;
   total: number;
+  /** File scan vs dir-node L0 rebuild. Omit = file. */
+  phase?: "file" | "dir";
 };
 
 /**

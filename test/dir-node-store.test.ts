@@ -109,6 +109,26 @@ describe("dir-node store integration", () => {
     expect(hits.some(h => h.kind === "dir")).toBe(true);
   });
 
+  test("reindexCollection onProgress reports file then dir phase", async () => {
+    const events: { phase?: string; current: number; total: number }[] = [];
+    await reindexCollection(store, collectionRoot, "**/*.md", collectionName, {
+      l0Source: "n",
+      onProgress: (info) => events.push({
+        phase: info.phase,
+        current: info.current,
+        total: info.total,
+      }),
+    });
+
+    const fileEvents = events.filter(e => (e.phase ?? "file") === "file");
+    const dirEvents = events.filter(e => e.phase === "dir");
+    expect(fileEvents.length).toBeGreaterThan(0);
+    expect(fileEvents[fileEvents.length - 1]!.current).toBe(fileEvents[fileEvents.length - 1]!.total);
+    expect(dirEvents.length).toBeGreaterThan(0);
+    expect(dirEvents[dirEvents.length - 1]!.current).toBe(dirEvents[dirEvents.length - 1]!.total);
+    expect(dirEvents.every(e => e.total === dirEvents[0]!.total)).toBe(true);
+  });
+
   test("QMD_DIR_NODES=0 with kind dir returns empty", () => {
     process.env.QMD_DIR_NODES = "0";
     const err = vi.spyOn(console, "error").mockImplementation(() => {});

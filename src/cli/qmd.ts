@@ -90,6 +90,7 @@ import {
   resolveEmbedSessionMaxDurationMs,
   syncConfigToDb,
   type ReindexResult,
+  type ReindexProgress,
   type ChunkStrategy,
   type DocumentKind,
   parseDocumentKind,
@@ -279,6 +280,29 @@ function formatETA(seconds: number): string {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
+type ReindexProgressState = {
+  phase?: "file" | "dir";
+  phaseStart: number;
+};
+
+/** TTY line per phase. Newline + fresh ETA when Indexing → Dir-nodes. */
+function writeReindexProgress(state: ReindexProgressState, info: ReindexProgress): void {
+  const phase = info.phase ?? "file";
+  if (state.phase !== phase) {
+    if (state.phase !== undefined && isTTY) process.stderr.write("\n");
+    state.phase = phase;
+    state.phaseStart = Date.now();
+  }
+  const total = info.total > 0 ? info.total : 1;
+  progress.set((info.current / total) * 100);
+  const elapsed = (Date.now() - state.phaseStart) / 1000;
+  const rate = info.current / Math.max(elapsed, 0.001);
+  const remaining = (info.total - info.current) / rate;
+  const eta = info.current > 2 ? ` ETA: ${formatETA(remaining)}` : "";
+  const label = phase === "dir" ? "Dir-nodes" : "Indexing";
+  if (isTTY) process.stderr.write(`\r${label}: ${info.current}/${info.total}${eta}        `);
 }
 
 
@@ -643,18 +667,11 @@ async function updateFiles(filePaths: string[], strict: boolean): Promise<void> 
   }
 
   console.log(`${c.bold}Updating ${targets.length} file(s)...${c.reset}\n`);
-  const startTime = Date.now();
+  const progressState: ReindexProgressState = { phaseStart: Date.now() };
   progress.indeterminate();
 
   const result = await reindexFiles(storeInstance, targets, {
-    onProgress: (info) => {
-      progress.set((info.current / info.total) * 100);
-      const elapsed = (Date.now() - startTime) / 1000;
-      const rate = info.current / elapsed;
-      const remaining = (info.total - info.current) / rate;
-      const eta = info.current > 2 ? ` ETA: ${formatETA(remaining)}` : "";
-      if (isTTY) process.stderr.write(`\rIndexing: ${info.current}/${info.total}${eta}        `);
-    },
+    onProgress: (info) => writeReindexProgress(progressState, info),
     resolveL0Source: resolveL0SourceForCollection,
   });
 
@@ -742,21 +759,14 @@ async function updateCollections(): Promise<void> {
       }
     }
 
-    const startTime = Date.now();
+    const progressState: ReindexProgressState = { phaseStart: Date.now() };
     console.log(`Collection: ${col.pwd} (${col.glob_pattern})`);
     progress.indeterminate();
 
     const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
       ignorePatterns: yamlCol?.ignore,
       l0Source: resolveL0SourceForCollection(col.name),
-      onProgress: (info) => {
-        progress.set((info.current / info.total) * 100);
-        const elapsed = (Date.now() - startTime) / 1000;
-        const rate = info.current / elapsed;
-        const remaining = (info.total - info.current) / rate;
-        const eta = info.current > 2 ? ` ETA: ${formatETA(remaining)}` : "";
-        if (isTTY) process.stderr.write(`\rIndexing: ${info.current}/${info.total}${eta}        `);
-      },
+      onProgress: (info) => writeReindexProgress(progressState, info),
     });
 
     progress.clear();

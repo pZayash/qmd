@@ -294,7 +294,7 @@ await store.renameCollection("old-name", "new-name")
 
 Directory **dir-nodes** (optional): set `l0Source: "p"` / YAML `l0_source: p` on a
 collection to use contract files at `.qmd/l0/<relpath>.md`; default `n` is extractive
-only (direct children plus `Ext` files / `Forms` dir names). Seed missing files with
+only (direct children plus `Ext` files / `Forms` / `Commands` / `Templates` dir names). Seed missing files with
 `qmd l0 seed qmd://col/dir` or `qmd l0 seed --all -c col` (skips existing). After
 `update`, run `embed`. Query hits include `kind: "dir"`. Set `QMD_DIR_NODES=0` to hide dir hits.
 
@@ -324,8 +324,8 @@ await store.setGlobalContext(undefined)  // clear global
 // Re-index collections by scanning the filesystem
 const result = await store.update({
   collections: ["docs"],  // optional — defaults to all
-  onProgress: ({ collection, file, current, total }) => {
-    console.log(`[${collection}] ${current}/${total} ${file}`)
+  onProgress: ({ collection, file, current, total, phase }) => {
+    console.log(`[${collection}] ${phase ?? "file"} ${current}/${total} ${file}`)
   },
 })
 // => { collections, indexed, updated, unchanged, removed, needsEmbedding }

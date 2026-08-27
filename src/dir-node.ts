@@ -91,6 +91,8 @@ export type ExtractiveL0Input = {
   childFiles: { basename: string; heading?: string }[];
   extFiles?: string[];
   formDirs?: string[];
+  commandDirs?: string[];
+  templateDirs?: string[];
 };
 
 function l0Fits(lines: string[], addition: string): boolean {
@@ -125,6 +127,8 @@ export function buildExtractiveL0(input: ExtractiveL0Input): string {
   let overflow = 0;
   const extFiles = input.extFiles ?? [];
   const formDirs = input.formDirs ?? [];
+  const commandDirs = input.commandDirs ?? [];
+  const templateDirs = input.templateDirs ?? [];
 
   l0PushLine(lines, input.dirRelPath);
   if (input.pathContext?.trim()) {
@@ -137,6 +141,8 @@ export function buildExtractiveL0(input: ExtractiveL0Input): string {
 
   overflow += l0PushCommaLine(lines, "Ext: ", extFiles);
   overflow += l0PushCommaLine(lines, "Forms: ", formDirs);
+  overflow += l0PushCommaLine(lines, "Commands: ", commandDirs);
+  overflow += l0PushCommaLine(lines, "Templates: ", templateDirs);
 
   if (input.childFiles.length > 0) {
     const count = `${input.childFiles.length} file${input.childFiles.length === 1 ? "" : "s"}`;
@@ -185,14 +191,16 @@ export function buildExtractiveL0(input: ExtractiveL0Input): string {
   return lines.join("\n");
 }
 
-/** Indexed-path expansion for exact child dirs `Ext` (files) and `Forms` (child dirs). */
+/** Indexed-path expansion: Ext files; Forms/Commands/Templates child dirs. */
 export function namedChildExpansion(
   filePaths: string[],
   dirRelPath: string,
-): { extFiles: string[]; formDirs: string[] } {
+): { extFiles: string[]; formDirs: string[]; commandDirs: string[]; templateDirs: string[] } {
   const { childDirs } = getDirectChildren(filePaths, dirRelPath);
   const extFiles: string[] = [];
   const formDirs: string[] = [];
+  const commandDirs: string[] = [];
+  const templateDirs: string[] = [];
   if (childDirs.includes("Ext")) {
     const extPath = dirRelPath ? `${dirRelPath}/Ext` : "Ext";
     extFiles.push(...getDirectChildren(filePaths, extPath).childFiles.map(f => f.basename));
@@ -201,7 +209,15 @@ export function namedChildExpansion(
     const formsPath = dirRelPath ? `${dirRelPath}/Forms` : "Forms";
     formDirs.push(...getDirectChildren(filePaths, formsPath).childDirs);
   }
-  return { extFiles, formDirs };
+  if (childDirs.includes("Commands")) {
+    const commandsPath = dirRelPath ? `${dirRelPath}/Commands` : "Commands";
+    commandDirs.push(...getDirectChildren(filePaths, commandsPath).childDirs);
+  }
+  if (childDirs.includes("Templates")) {
+    const templatesPath = dirRelPath ? `${dirRelPath}/Templates` : "Templates";
+    templateDirs.push(...getDirectChildren(filePaths, templatesPath).childDirs);
+  }
+  return { extFiles, formDirs, commandDirs, templateDirs };
 }
 
 function contractL0FullPath(collectionRoot: string, dirRelPath: string): string {
@@ -217,7 +233,7 @@ export function buildExtractiveL0ForDir(
   pathContext: string | null,
 ): string {
   const { childDirs, childFiles } = getDirectChildren(filePaths, dirRelPath);
-  const { extFiles, formDirs } = namedChildExpansion(filePaths, dirRelPath);
+  const { extFiles, formDirs, commandDirs, templateDirs } = namedChildExpansion(filePaths, dirRelPath);
   return buildExtractiveL0({
     dirRelPath,
     pathContext,
@@ -229,6 +245,8 @@ export function buildExtractiveL0ForDir(
     })),
     extFiles,
     formDirs,
+    commandDirs,
+    templateDirs,
   });
 }
 

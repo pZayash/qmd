@@ -51,9 +51,13 @@ describe("dir-node helpers", () => {
       childFiles: [],
       extFiles: ["ManagerModule.bsl", "ObjectModule.bsl"],
       formDirs: ["ФормаДокумента", "ФормаСписка"],
+      commandDirs: ["Провести"],
+      templateDirs: ["ПФ_MXL"],
     });
     expect(text).toContain("Ext: ManagerModule.bsl, ObjectModule.bsl");
     expect(text).toContain("Forms: ФормаДокумента, ФормаСписка");
+    expect(text).toContain("Commands: Провести");
+    expect(text).toContain("Templates: ПФ_MXL");
     expect(text).toContain("dirs: Commands, Ext, Forms, Templates");
   });
 
@@ -67,6 +71,8 @@ describe("dir-node helpers", () => {
     expect(text).not.toMatch(/^Ext:/m);
     expect(text).not.toContain("Ext:");
     expect(text).not.toContain("Forms:");
+    expect(text).not.toContain("Commands:");
+    expect(text).not.toContain("Templates:");
   });
 
   test("buildExtractiveL0 drops whole form names under 500 chars", () => {
@@ -87,16 +93,36 @@ describe("dir-node helpers", () => {
     expect(text.endsWith("...")).toBe(false);
   });
 
-  test("namedChildExpansion reads Ext files and Forms dirs, not Commands", () => {
+  test("buildExtractiveL0 drops whole command names under 500 chars", () => {
+    const commandDirs = Array.from({ length: 40 }, (_, i) =>
+      `КомандаОченьДлинноеИмяДляПроверкиБюджета${String(i).padStart(3, "0")}`,
+    );
+    const naive = `obj\nCommands: ${commandDirs.join(", ")}`;
+    expect(naive.length).toBeGreaterThan(500);
+    const text = buildExtractiveL0({
+      dirRelPath: "obj",
+      childDirs: [],
+      childFiles: [],
+      commandDirs,
+    });
+    expect(text.length).toBeLessThanOrEqual(500);
+    expect(text).toMatch(/\+\d+ more$/);
+    expect(text.endsWith("...")).toBe(false);
+  });
+
+  test("namedChildExpansion reads Ext files and Forms/Commands/Templates dirs", () => {
     const files = [
       "obj/Ext/ManagerModule.bsl",
       "obj/Ext/ObjectModule.bsl",
       "obj/Forms/ФормаДокумента/Module.bsl",
       "obj/Commands/X/Ext/CommandModule.bsl",
+      "obj/Templates/ПФ_MXL/Template.txt",
     ];
     expect(namedChildExpansion(files, "obj")).toEqual({
       extFiles: ["ManagerModule.bsl", "ObjectModule.bsl"],
       formDirs: ["ФормаДокумента"],
+      commandDirs: ["X"],
+      templateDirs: ["ПФ_MXL"],
     });
   });
 

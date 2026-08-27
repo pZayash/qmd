@@ -1451,10 +1451,14 @@ export type Store = {
 // Reindex & Embed — pure-logic functions for SDK and CLI
 // =============================================================================
 
+export type ReindexPhase = "file" | "dir";
+
 export type ReindexProgress = {
   file: string;
   current: number;
   total: number;
+  /** File scan vs dir-node L0 rebuild. Omit = file. */
+  phase?: ReindexPhase;
 };
 
 export type DocumentKind = "file" | "dir";
@@ -1793,6 +1797,7 @@ export async function rebuildDirNodes(
     l0Source: L0Source;
     pathContextLookup: (path: string) => string | null;
     limitToDirs?: string[];
+    onProgress?: (info: ReindexProgress) => void;
   },
 ): Promise<{ upserted: number; deactivated: number }> {
   const now = new Date().toISOString();
@@ -1808,23 +1813,28 @@ export async function rebuildDirNodes(
 
   let upserted = 0;
   let deactivated = 0;
+  const dirList = [...targetDirs];
+  const total = dirList.length;
+  let current = 0;
 
-  for (const dirPath of targetDirs) {
+  for (const dirPath of dirList) {
     if (!dirHasIndexedFiles(filePaths, dirPath)) {
       deactivated += deactivateDirNode(db, collectionName, dirPath);
-      continue;
+    } else {
+      const result = await upsertDirNode(
+        db,
+        collectionName,
+        collectionPath,
+        dirPath,
+        filePaths,
+        options.l0Source,
+        options.pathContextLookup,
+        now,
+      );
+      if (result === "indexed" || result === "updated") upserted++;
     }
-    const result = await upsertDirNode(
-      db,
-      collectionName,
-      collectionPath,
-      dirPath,
-      filePaths,
-      options.l0Source,
-      options.pathContextLookup,
-      now,
-    );
-    if (result === "indexed" || result === "updated") upserted++;
+    current++;
+    options.onProgress?.({ file: dirPath, current, total, phase: "dir" });
   }
 
   if (!options.limitToDirs) {
@@ -1889,7 +1899,7 @@ export async function reindexFiles(
     }
 
     processed++;
-    options?.onProgress?.({ file: target.relativePath, current: processed, total });
+    options?.onProgress?.({ file: target.relativePath, current: processed, total, phase: "file" });
   }
 
   for (const [collectionName, dirSet] of limitDirsByCollection) {
@@ -1899,6 +1909,7 @@ export async function reindexFiles(
       l0Source: resolveL0(collectionName),
       pathContextLookup: (path) => getContextForPath(db, collectionName, path),
       limitToDirs: [...dirSet],
+      onProgress: options?.onProgress,
     });
   }
 
@@ -1958,7 +1969,7 @@ export async function reindexCollection(
     }
 
     processed++;
-    options?.onProgress?.({ file: relativeFile, current: processed, total });
+    options?.onProgress?.({ file: relativeFile, current: processed, total, phase: "file" });
   }
 
   // Deactivate file documents that no longer exist
@@ -1974,6 +1985,7 @@ export async function reindexCollection(
   await rebuildDirNodes(db, collectionName, collectionPath, {
     l0Source: options?.l0Source ?? "n",
     pathContextLookup: (path) => getContextForPath(db, collectionName, path),
+    onProgress: options?.onProgress,
   });
 
   resolveDocEdges(db, collectionName);
