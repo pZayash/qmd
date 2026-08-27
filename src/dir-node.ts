@@ -2,8 +2,8 @@
  * Dir-node L0 helpers — extractive summaries, contract files, 1C xml peek.
  */
 
-import { readFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync, statSync, openSync, readSync, closeSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 export type L0Source = "n" | "p" | "q";
 export type DocumentKind = "file" | "dir";
@@ -204,17 +204,72 @@ export function namedChildExpansion(
   return { extFiles, formDirs };
 }
 
+function contractL0FullPath(collectionRoot: string, dirRelPath: string): string {
+  const rel = join(".qmd", "l0", `${dirRelPath.replace(/\\/g, "/")}.md`);
+  return join(collectionRoot, rel);
+}
+
+/** Same child/xml/heading assembly as dir-node rebuild (extractive only). */
+export function buildExtractiveL0ForDir(
+  collectionRoot: string,
+  dirRelPath: string,
+  filePaths: string[],
+  pathContext: string | null,
+): string {
+  const { childDirs, childFiles } = getDirectChildren(filePaths, dirRelPath);
+  const { extFiles, formDirs } = namedChildExpansion(filePaths, dirRelPath);
+  return buildExtractiveL0({
+    dirRelPath,
+    pathContext,
+    xmlPeek: peek1cXml(xmlPathForDir(collectionRoot, dirRelPath)),
+    childDirs,
+    childFiles: childFiles.map(f => ({
+      basename: f.basename,
+      heading: readFirstMarkdownHeading(collectionRoot, f.path),
+    })),
+    extFiles,
+    formDirs,
+  });
+}
+
+/** Dirs to seed: one named dir-node, or all dir-nodes from file paths. */
+export function resolveSeedDirs(
+  filePaths: string[],
+  dirRelPath?: string,
+): { dirs: string[] } | { error: string } {
+  const known = collectDirPathsFromFiles(filePaths);
+  if (dirRelPath === undefined) {
+    return { dirs: [...known].sort() };
+  }
+  const rel = dirRelPath.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!rel) return { error: "directory path is empty" };
+  if (!known.has(rel)) return { error: `Not a dir-node (no indexed files under it): ${rel}` };
+  return { dirs: [rel] };
+}
+
 /** Shadow contract: `{collectionRoot}/.qmd/l0/{dirRelPath}.md` */
 export function readContractL0(collectionRoot: string, dirRelPath: string): string | null {
-  const rel = join(".qmd", "l0", `${dirRelPath.replace(/\\/g, "/")}.md`);
-  const full = join(collectionRoot, rel);
   try {
-    const text = readFileSync(full, "utf-8");
+    const text = readFileSync(contractL0FullPath(collectionRoot, dirRelPath), "utf-8");
     const trimmed = text.trim();
     return trimmed.length > 0 ? trimmed : null;
   } catch {
     return null;
   }
+}
+
+/** Write extractive L0 into a missing/empty contract. Skip non-empty. */
+export function writeContractL0(
+  collectionRoot: string,
+  dirRelPath: string,
+  text: string,
+): "written" | "skipped" {
+  if (readContractL0(collectionRoot, dirRelPath)) return "skipped";
+  const full = contractL0FullPath(collectionRoot, dirRelPath);
+  mkdirSync(dirname(full), { recursive: true });
+  const body = text.endsWith("\n") ? text : `${text}\n`;
+  writeFileSync(full, body, "utf-8");
+  return "written";
 }
 
 export function chooseL0Text(opts: {

@@ -19,6 +19,7 @@ qmd collection list               # List all collections with details
 qmd collection remove <name>      # Remove a collection by name
 qmd collection rename <old> <new> # Rename a collection
 qmd ls [collection[/path]]        # List collections or files in a collection
+qmd l0 seed <path> | --all        # Seed missing .qmd/l0 contracts from extractive L0
 qmd context add [path] "text"     # Add context for path (defaults to current dir)
 qmd context list                  # List all contexts
 qmd context check                 # Check for collections/paths missing context
@@ -67,7 +68,7 @@ qmd mcp stop                      # Stop background MCP daemon
 
 - **Collection mask** — only paths matching the collection glob are indexed. Example: mask `**/*.{md,bsl}` excludes `*.xml` (e.g. 1C `Form.xml`); add `xml` to the mask and run `qmd update` if those files must be searchable.
 
-- **Dir-nodes** — `qmd update` builds a searchable L0 summary per directory with indexed files (`kind: dir` in query hits). Config `l0_source` on collection or `models`: `n` extractive (default), `p` read `{collectionRoot}/.qmd/l0/<relpath>.md`, `q` reserved (falls back to extractive). 1C dirs peek sibling `<Name>.xml` for Name/ru Synonym without indexing xml. Extractive L0 also lists `Ext` file basenames and `Forms` child dir names. `QMD_DIR_NODES=0` hides dir hits. `--kind file|dir` filters retrieval. Run `qmd update` then `qmd embed` after enabling.
+- **Dir-nodes** — `qmd update` builds a searchable L0 summary per directory with indexed files (`kind: dir` in query hits). Config `l0_source` on collection or `models`: `n` extractive (default), `p` read `{collectionRoot}/.qmd/l0/<relpath>.md`, `q` reserved (falls back to extractive). Seed missing contracts with `qmd l0 seed <qmd://col/dir>` (one dir) or `qmd l0 seed --all -c <col>` (never overwrites non-empty; not part of `update`). If `l0_source` is `n`, seed still writes and warns. Then `qmd update` + `qmd embed`. 1C dirs peek sibling `<Name>.xml` for Name/ru Synonym without indexing xml. Extractive L0 also lists `Ext` file basenames and `Forms` child dir names. `QMD_DIR_NODES=0` hides dir hits. `--kind file|dir` filters retrieval.
 
 ## Collection Management
 

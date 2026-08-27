@@ -39,16 +39,11 @@ import type { LinkRef } from "./links.js";
 import { slugifyAnchor } from "./links.js";
 import {
   ancestorDirPaths,
-  buildExtractiveL0,
+  buildExtractiveL0ForDir,
   chooseL0Text,
   collectDirPathsFromFiles,
   dirHasIndexedFiles,
-  getDirectChildren,
-  namedChildExpansion,
-  peek1cXml,
   readContractL0,
-  readFirstMarkdownHeading,
-  xmlPathForDir,
   parseDocumentKind,
   type L0Source,
 } from "./dir-node.js";
@@ -1760,22 +1755,12 @@ async function upsertDirNode(
   pathContextLookup: (path: string) => string | null,
   now: string,
 ): Promise<"indexed" | "updated" | "unchanged"> {
-  const { childDirs, childFiles } = getDirectChildren(filePaths, dirRelPath);
-  const { extFiles, formDirs } = namedChildExpansion(filePaths, dirRelPath);
-  const pathContext = pathContextLookup(dirRelPath);
-  const xmlPeek = peek1cXml(xmlPathForDir(collectionPath, dirRelPath));
-  const extractive = buildExtractiveL0({
+  const extractive = buildExtractiveL0ForDir(
+    collectionPath,
     dirRelPath,
-    pathContext,
-    xmlPeek,
-    childDirs,
-    childFiles: childFiles.map(f => ({
-      basename: f.basename,
-      heading: readFirstMarkdownHeading(collectionPath, f.path),
-    })),
-    extFiles,
-    formDirs,
-  });
+    filePaths,
+    pathContextLookup(dirRelPath),
+  );
   const contract = readContractL0(collectionPath, dirRelPath);
   const l0Text = chooseL0Text({ source: l0Source, contract, extractive });
   const hash = await hashContent(l0Text);

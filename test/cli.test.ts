@@ -10,7 +10,7 @@ import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
 import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join, dirname } from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { spawn } from "child_process";
 import { setTimeout as sleep } from "timers/promises";
 import { buildEditorUri, parseDotEnvValue, termLink } from "../src/cli/qmd.ts";
@@ -26,14 +26,7 @@ let testCounter = 0; // Unique counter for each test run
 const thisDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(thisDir, "..");
 const qmdScript = join(projectRoot, "src", "cli", "qmd.ts");
-// Resolve tsx binary from project's node_modules (not cwd-dependent)
-const tsxBin = (() => {
-  const candidate = join(projectRoot, "node_modules", ".bin", "tsx");
-  if (existsSync(candidate)) {
-    return candidate;
-  }
-  return join(process.cwd(), "node_modules", ".bin", "tsx");
-})();
+const tsxLoader = join(projectRoot, "node_modules", "tsx", "dist", "esm", "index.mjs");
 
 // Helper to run qmd command with test database
 async function runQmd(
@@ -43,7 +36,7 @@ async function runQmd(
   const workingDir = options.cwd || fixturesDir;
   const dbPath = options.dbPath || testDbPath;
   const configDir = options.configDir || testConfigDir;
-  const proc = spawn(tsxBin, [qmdScript, ...args], {
+  const proc = spawn(process.execPath, ["--import", pathToFileURL(tsxLoader).href, qmdScript, ...args], {
     cwd: workingDir,
     env: {
       ...process.env,
@@ -231,6 +224,7 @@ describe("CLI Help", () => {
     expect(exitCode).toBe(0);
     expect(stdout).toContain("Usage:");
     expect(stdout).toContain("qmd collection add");
+    expect(stdout).toContain("qmd l0 seed");
     expect(stdout).toContain("qmd search");
     expect(stdout).toContain("qmd skill show/install");
   });
@@ -881,6 +875,69 @@ describe("CLI ls Command", () => {
   });
 });
 
+describe("CLI l0 seed", () => {
+  let dbPath: string;
+  let configDir: string;
+  let root: string;
+
+  beforeAll(async () => {
+    const env = await createIsolatedTestEnv("l0-seed");
+    dbPath = env.dbPath;
+    configDir = env.configDir;
+    root = join(testDir, "l0-seed-root");
+    await mkdir(join(root, "notes"), { recursive: true });
+    await writeFile(join(root, "notes", "a.md"), "# Alpha\n");
+    await writeFile(join(root, "notes", "b.md"), "# Beta\n");
+    const { exitCode, stderr } = await runQmd(
+      ["collection", "add", root, "--name", "seedcol"],
+      { dbPath, configDir, cwd: root },
+    );
+    if (exitCode !== 0) console.error("l0 seed collection add failed:", stderr);
+    expect(exitCode).toBe(0);
+  });
+
+  test("seeds one missing dir-node contract", async () => {
+    const { stdout, stderr, exitCode } = await runQmd(
+      ["l0", "seed", "qmd://seedcol/notes"],
+      { dbPath, configDir, cwd: root },
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/wrote.*notes\.md/);
+    const contract = join(root, ".qmd", "l0", "notes.md");
+    expect(existsSync(contract)).toBe(true);
+    expect(readFileSync(contract, "utf-8")).toContain("notes");
+    expect(stderr).toMatch(/l0_source is n/);
+  });
+
+  test("skips non-empty existing contract", async () => {
+    const { stdout, exitCode } = await runQmd(
+      ["l0", "seed", "qmd://seedcol/notes"],
+      { dbPath, configDir, cwd: root },
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/skip.*notes\.md/);
+    expect(readFileSync(join(root, ".qmd", "l0", "notes.md"), "utf-8")).toContain("notes");
+  });
+
+  test("unknown dir exits 1", async () => {
+    const { stderr, exitCode } = await runQmd(
+      ["l0", "seed", "qmd://seedcol/nope"],
+      { dbPath, configDir, cwd: root },
+    );
+    expect(exitCode).toBe(1);
+    expect(stderr).toMatch(/Not a dir-node/);
+  });
+
+  test("--all with directory path exits 1", async () => {
+    const { stderr, exitCode } = await runQmd(
+      ["l0", "seed", "--all", "qmd://seedcol/notes"],
+      { dbPath, configDir, cwd: root },
+    );
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("cannot take a directory path");
+  });
+});
+
 describe("CLI Collection Commands", () => {
   let localDbPath: string;
 
@@ -1415,7 +1472,7 @@ describe("mcp http daemon", () => {
 
   /** Spawn a foreground HTTP server (non-blocking) and return the process */
   function spawnHttpServer(port: number): import("child_process").ChildProcess {
-    const proc = spawn(tsxBin, [qmdScript, "mcp", "--http", "--port", String(port)], {
+    const proc = spawn(process.execPath, ["--import", pathToFileURL(tsxLoader).href, qmdScript, "mcp", "--http", "--port", String(port)], {
       cwd: fixturesDir,
       env: {
         ...process.env,

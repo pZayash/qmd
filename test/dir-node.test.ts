@@ -13,6 +13,9 @@ import {
   namedChildExpansion,
   listIndexedChildren,
   MAX_LS_CHILDREN,
+  buildExtractiveL0ForDir,
+  writeContractL0,
+  resolveSeedDirs,
 } from "../src/dir-node.js";
 
 describe("dir-node helpers", () => {
@@ -141,6 +144,40 @@ describe("dir-node helpers", () => {
     await mkdir(join(root, ".qmd", "l0", "docs"), { recursive: true });
     await writeFile(join(root, ".qmd", "l0", "docs", "ai.md"), "Contract L0 text\n");
     expect(readContractL0(root, "docs/ai")).toBe("Contract L0 text");
+  });
+
+  test("writeContractL0 writes missing file then skips non-empty", async () => {
+    const root = await mkdtemp(join(tmpdir(), "qmd-seed-"));
+    expect(writeContractL0(root, "docs/ai", "first")).toBe("written");
+    expect(readContractL0(root, "docs/ai")).toBe("first");
+    expect(writeContractL0(root, "docs/ai", "second")).toBe("skipped");
+    expect(readContractL0(root, "docs/ai")).toBe("first");
+  });
+
+  test("writeContractL0 overwrites empty contract", async () => {
+    const root = await mkdtemp(join(tmpdir(), "qmd-seed-empty-"));
+    await mkdir(join(root, ".qmd", "l0", "docs"), { recursive: true });
+    await writeFile(join(root, ".qmd", "l0", "docs", "ai.md"), "  \n");
+    expect(writeContractL0(root, "docs/ai", "filled")).toBe("written");
+    expect(readContractL0(root, "docs/ai")).toBe("filled");
+  });
+
+  test("buildExtractiveL0ForDir lists file basename and heading", async () => {
+    const root = await mkdtemp(join(tmpdir(), "qmd-extract-"));
+    await mkdir(join(root, "docs", "ai"), { recursive: true });
+    await writeFile(join(root, "docs", "ai", "one.md"), "# Heading One\nbody\n");
+    const text = buildExtractiveL0ForDir(root, "docs/ai", ["docs/ai/one.md"], null);
+    expect(text).toContain("one.md");
+    expect(text).toContain("Heading One");
+  });
+
+  test("resolveSeedDirs is one dir or all dir-nodes, unknown errors", () => {
+    const files = ["docs/ai/one.md", "docs/other/x.md"];
+    expect(resolveSeedDirs(files, "docs/ai")).toEqual({ dirs: ["docs/ai"] });
+    expect(resolveSeedDirs(files).dirs).toEqual(["docs", "docs/ai", "docs/other"]);
+    expect(resolveSeedDirs(files, "nope")).toEqual({
+      error: "Not a dir-node (no indexed files under it): nope",
+    });
   });
 
   test("chooseL0Text respects n/p/q modes", () => {

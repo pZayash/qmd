@@ -294,8 +294,9 @@ await store.renameCollection("old-name", "new-name")
 
 Directory **dir-nodes** (optional): set `l0Source: "p"` / YAML `l0_source: p` on a
 collection to use contract files at `.qmd/l0/<relpath>.md`; default `n` is extractive
-only (direct children plus `Ext` files / `Forms` dir names). After `update`, run
-`embed`. Query hits include `kind: "dir"`. Set `QMD_DIR_NODES=0` to hide dir hits.
+only (direct children plus `Ext` files / `Forms` dir names). Seed missing files with
+`qmd l0 seed qmd://col/dir` or `qmd l0 seed --all -c col` (skips existing). After
+`update`, run `embed`. Query hits include `kind: "dir"`. Set `QMD_DIR_NODES=0` to hide dir hits.
 
 #### Context
 
@@ -569,6 +570,10 @@ qmd collection rename myproject my-project
 # List files in a collection
 qmd ls notes
 qmd ls notes/subfolder
+
+# Seed missing L0 contracts (extractive). Then update + embed. Set l0_source: p to use them.
+qmd l0 seed qmd://notes/subfolder
+qmd l0 seed --all -c notes
 ```
 
 ### Generate Vector Embeddings

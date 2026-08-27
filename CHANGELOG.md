@@ -25,6 +25,10 @@
   path prefixes). Omit `path` to list collections. Cap 200 with truncation.
   Not search and not agent drill. CLI `qmd ls` still dumps all files under a
   prefix. Restart MCP daemon to pick up the tool.
+- `qmd l0 seed`: write extractive L0 into missing `.qmd/l0/<relpath>.md`
+  contracts (one dir, or `--all` for a collection). Skips non-empty files.
+  Not MCP. Not part of `qmd update`. If `l0_source` is `n`, still writes and
+  warns. Then run `qmd update` and `qmd embed` (not automatic).
 
 - Added: `QMD_EMBED_CONCURRENCY` for parallel OpenRouter embedding with 429
   backoff and abort propagation (local llama path unchanged).

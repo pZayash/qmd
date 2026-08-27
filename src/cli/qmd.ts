@@ -120,6 +120,11 @@ import {
   getEffectiveL0Source,
 } from "../collections.js";
 import { getEmbeddedQmdSkillContent, getEmbeddedQmdSkillFiles } from "../embedded-skills.js";
+import {
+  buildExtractiveL0ForDir,
+  resolveSeedDirs,
+  writeContractL0,
+} from "../dir-node.js";
 
 // Enable production mode - allows using default database path
 // Tests must set INDEX_PATH or use createStore() with explicit path
@@ -1491,6 +1496,171 @@ function formatLsTime(date: Date): string {
     const minutes = date.getMinutes().toString().padStart(2, '0');
     return `${month} ${day} ${hours}:${minutes}`;
   }
+}
+
+function parseLsStylePath(pathArg: string): { collectionName: string; dirRelPath: string } | { error: string } {
+  const trimmed = pathArg.trim().replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!trimmed) return { error: "empty path" };
+  if (trimmed.startsWith("qmd://")) {
+    const parsed = parseVirtualPath(trimmed);
+    if (!parsed) return { error: `Invalid virtual path: ${pathArg}` };
+    return {
+      collectionName: parsed.collectionName,
+      dirRelPath: parsed.path.replace(/\/+$/, ""),
+    };
+  }
+  const slash = trimmed.indexOf("/");
+  if (slash === -1) {
+    return { collectionName: trimmed, dirRelPath: "" };
+  }
+  return {
+    collectionName: trimmed.slice(0, slash),
+    dirRelPath: trimmed.slice(slash + 1).replace(/\/+$/, ""),
+  };
+}
+
+function seedL0Usage(): never {
+  console.error("Usage: qmd l0 seed <path> | qmd l0 seed --all -c <collection>");
+  console.error("  path: qmd://collection/dir or collection/dir (one dir-node)");
+  console.error("  -c:   positional path is collection-relative");
+  console.error("  --all: seed every dir-node in the collection");
+  closeDb();
+  process.exit(1);
+}
+
+function seedL0Contracts(pathArg: string | undefined, all: boolean, collectionFlags?: string[]): void {
+  const cFlag = collectionFlags?.filter(Boolean) ?? [];
+  if (cFlag.length > 1) {
+    console.error("qmd l0 seed: pass at most one -c collection");
+    closeDb();
+    process.exit(1);
+  }
+
+  if (all && pathArg) {
+    const parsed = pathArg.startsWith("qmd://") || pathArg.includes("/")
+      ? parseLsStylePath(pathArg)
+      : { collectionName: pathArg.replace(/\\/g, "/"), dirRelPath: "" };
+    if ("error" in parsed) {
+      console.error(parsed.error);
+      closeDb();
+      process.exit(1);
+    }
+    if (parsed.dirRelPath) {
+      console.error("qmd l0 seed --all cannot take a directory path (no recursive seed)");
+      closeDb();
+      process.exit(1);
+    }
+    if (cFlag.length === 1 && cFlag[0] !== parsed.collectionName) {
+      console.error(`qmd l0 seed: -c ${cFlag[0]} does not match ${parsed.collectionName}`);
+      closeDb();
+      process.exit(1);
+    }
+  }
+
+  if (!all && !pathArg) seedL0Usage();
+  if (all && !pathArg && cFlag.length === 0) seedL0Usage();
+
+  let collectionName: string;
+  let dirRelPath: string | undefined;
+
+  if (all) {
+    if (cFlag[0]) {
+      collectionName = cFlag[0];
+    } else {
+      const parsed = parseLsStylePath(pathArg!);
+      if ("error" in parsed) {
+        console.error(parsed.error);
+        closeDb();
+        process.exit(1);
+      }
+      collectionName = parsed.collectionName;
+    }
+    dirRelPath = undefined;
+  } else if (cFlag.length === 1) {
+    collectionName = cFlag[0]!;
+    const raw = pathArg!.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+    if (raw.startsWith("qmd://")) {
+      const parsed = parseVirtualPath(raw);
+      if (!parsed) {
+        console.error(`Invalid virtual path: ${pathArg}`);
+        closeDb();
+        process.exit(1);
+      }
+      if (parsed.collectionName !== collectionName) {
+        console.error(`qmd l0 seed: -c ${collectionName} does not match ${parsed.collectionName}`);
+        closeDb();
+        process.exit(1);
+      }
+      dirRelPath = parsed.path.replace(/\/+$/, "");
+    } else {
+      dirRelPath = raw;
+    }
+    if (!dirRelPath) {
+      console.error("qmd l0 seed: directory path required (or use --all)");
+      closeDb();
+      process.exit(1);
+    }
+  } else {
+    const parsed = parseLsStylePath(pathArg!);
+    if ("error" in parsed) {
+      console.error(parsed.error);
+      closeDb();
+      process.exit(1);
+    }
+    collectionName = parsed.collectionName;
+    dirRelPath = parsed.dirRelPath;
+    if (!dirRelPath) {
+      console.error("qmd l0 seed: directory path required (or use --all)");
+      closeDb();
+      process.exit(1);
+    }
+  }
+
+  const coll = getCollectionFromYaml(collectionName);
+  if (!coll) {
+    console.error(`Collection not found: ${collectionName}`);
+    closeDb();
+    process.exit(1);
+  }
+
+  const db = getDb();
+  const filePaths = getActiveFileDocumentPaths(db, collectionName);
+  const resolved = resolveSeedDirs(filePaths, dirRelPath);
+  if ("error" in resolved) {
+    console.error(resolved.error);
+    closeDb();
+    process.exit(1);
+  }
+
+  const l0Source = resolveL0SourceForCollection(collectionName);
+  if (l0Source === "n") {
+    console.error("l0_source is n: contracts will be ignored by qmd update until l0_source is p");
+  }
+
+  let written = 0;
+  let skipped = 0;
+  for (const dir of resolved.dirs) {
+    const extractive = buildExtractiveL0ForDir(
+      coll.path,
+      dir,
+      filePaths,
+      getContextForPath(db, collectionName, dir),
+    );
+    const result = writeContractL0(coll.path, dir, extractive);
+    if (result === "written") {
+      written++;
+      console.log(`wrote .qmd/l0/${dir}.md`);
+    } else {
+      skipped++;
+      console.log(`skip  .qmd/l0/${dir}.md (exists)`);
+    }
+  }
+
+  console.log(`Seeded ${written} written, ${skipped} skipped.`);
+  if (written > 0) {
+    console.log("Then: qmd update && qmd embed  (not run automatically)");
+  }
+  closeDb();
 }
 
 // Collection management commands
@@ -3165,6 +3335,7 @@ function showHelp(): void {
   console.log("  qmd collection add/list/remove/rename/show   - Manage indexed folders");
   console.log("  qmd context add/list/rm                      - Attach human-written summaries");
   console.log("  qmd ls [collection[/path]]                   - Inspect indexed files");
+  console.log("  qmd l0 seed <path> | --all                   - Seed missing .qmd/l0 contracts (extractive)");
   console.log("  qmd links <doc> [--dangling|--backfill] [-c collection] - Link graph views / backfill from index");
   console.log("");
   console.log("Maintenance:");
@@ -3530,6 +3701,18 @@ if (isMain) {
 
     case "ls": {
       listFiles(cli.args[0]);
+      break;
+    }
+
+    case "l0": {
+      const subcommand = cli.args[0];
+      if (subcommand !== "seed") {
+        console.error("Usage: qmd l0 seed <path> | qmd l0 seed --all -c <collection>");
+        process.exit(1);
+      }
+      const cols = cli.opts.collection;
+      const collectionFlags = cols === undefined ? undefined : Array.isArray(cols) ? cols : [cols];
+      seedL0Contracts(cli.args[1], !!cli.values.all, collectionFlags);
       break;
     }
 
