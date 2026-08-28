@@ -33,6 +33,10 @@
 - `qmd update` prints `Dir-nodes: n/m` on TTY after file indexing so the L0
   rebuild is not a silent pause. SDK `onProgress` includes `phase: "file" | "dir"`
   (ETA resets when the phase changes).
+- Mix `qmd query` (no `--kind`) multiplies dir-node RRF scores by
+  `QMD_DIR_RRF_WEIGHT` (default `0.5`, clamp `[0, 1]`, `1.0` = off) before
+  `-C`. `--kind dir` is unweighted. Not `search`/`vsearch`. Restart MCP daemon
+  to pick up the env.
 
 - Added: `QMD_EMBED_CONCURRENCY` for parallel OpenRouter embedding with 429
   backoff and abort propagation (local llama path unchanged).

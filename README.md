@@ -297,6 +297,7 @@ collection to use contract files at `.qmd/l0/<relpath>.md`; default `n` is extra
 only (direct children plus `Ext` files / `Forms` / `Commands` / `Templates` dir names). Seed missing files with
 `qmd l0 seed qmd://col/dir` or `qmd l0 seed --all -c col` (skips existing). After
 `update`, run `embed`. Query hits include `kind: "dir"`. Set `QMD_DIR_NODES=0` to hide dir hits.
+Mix `query` (no `--kind`) scales dir RRF scores by `QMD_DIR_RRF_WEIGHT` (default `0.5`; `1.0` = off). Restart the MCP daemon after changing the env.
 
 #### Context
 

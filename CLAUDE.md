@@ -62,7 +62,7 @@ qmd mcp stop                      # Stop background MCP daemon
   qmd query "token" --path conf/Documents/ЗаказПокупателя/ --kind file
   ```
 
-- **Kind filter** — `--kind file|dir` (not repeatable) restricts hits to files or dir-nodes at SQL level before RRF. Omit = mix. Invalid value → exit 1. `QMD_DIR_NODES=0` wins over `--kind dir` (empty). Works with `query`, `search`, `vsearch`, MCP `query`.
+- **Kind filter** — `--kind file|dir` (not repeatable) restricts hits to files or dir-nodes at SQL level before RRF. Omit = mix. Invalid value → exit 1. `QMD_DIR_NODES=0` wins over `--kind dir` (empty). Works with `query`, `search`, `vsearch`, MCP `query`. Mix `query` also scales dir RRF scores by `QMD_DIR_RRF_WEIGHT` (default `0.5`; `1` = off; clamp `[0,1]`). Restart MCP daemon after changing the env.
 
 - **Agent drill** — after a dir hit: `qmd get` the L0, then search with `--path <dir>/` (trailing slash) and `--kind file`. MCP `query` has `path: string[]` (OR, same as CLI). No `drill` tool. MCP `ls` is one-level index browse, not drill. `get` payload unchanged.
 

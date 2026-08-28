@@ -1467,6 +1467,20 @@ export function dirNodesDisabled(): boolean {
   return process.env.QMD_DIR_NODES === "0";
 }
 
+const DEFAULT_DIR_RRF_WEIGHT = 0.5;
+
+/** Mix-query dir multiplier. Unset/invalid → 0.5. Clamp [0, 1]. */
+export function resolveDirRrfWeight(): number {
+  const raw = process.env.QMD_DIR_RRF_WEIGHT;
+  if (raw === undefined) return DEFAULT_DIR_RRF_WEIGHT;
+  const trimmed = raw.trim();
+  if (trimmed === "") return DEFAULT_DIR_RRF_WEIGHT;
+  const n = Number(trimmed);
+  if (Number.isFinite(n) && n >= 0 && n <= 1) return n;
+  console.error(`Invalid QMD_DIR_RRF_WEIGHT ${JSON.stringify(raw)}; defaulting to ${DEFAULT_DIR_RRF_WEIGHT}`);
+  return DEFAULT_DIR_RRF_WEIGHT;
+}
+
 /** SQL kind predicate: undefined = mix; empty = no rows; file/dir = constrain. */
 export function resolveRetrievalKind(kind?: DocumentKind): DocumentKind | "empty" | undefined {
   if (dirNodesDisabled()) {
@@ -4952,6 +4966,16 @@ export function reciprocalRankFusion(
     .map(e => ({ ...e.result, score: e.rrfScore }));
 }
 
+/** Mix only: scale dir fused scores, re-sort. Kind filter skips. Does not mutate `fused`. */
+export function applyDirRrfWeight(fused: RankedResult[], kind?: DocumentKind): RankedResult[] {
+  if (kind === "file" || kind === "dir") return fused;
+  const w = resolveDirRrfWeight();
+  if (w === 1) return fused;
+  return fused
+    .map(r => r.kind === "dir" ? { ...r, score: r.score * w } : r)
+    .sort((a, b) => b.score - a.score);
+}
+
 /**
  * Build per-document RRF contribution traces for explain/debug output.
  */
@@ -5694,7 +5718,7 @@ export async function hybridQuery(
 
   // Step 4: RRF fusion — first 2 lists (original FTS + first vec) get 2x weight
   const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
-  const fused = reciprocalRankFusion(rankedLists, weights);
+  const fused = applyDirRrfWeight(reciprocalRankFusion(rankedLists, weights), kind);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
 
@@ -6101,7 +6125,7 @@ export async function structuredSearch(
 
   // Step 3: RRF fusion — first list gets 2x weight (assume caller ordered by importance)
   const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
-  const fused = reciprocalRankFusion(rankedLists, weights);
+  const fused = applyDirRrfWeight(reciprocalRankFusion(rankedLists, weights), kind);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
   const candidates = fused.slice(0, candidateLimit);
 

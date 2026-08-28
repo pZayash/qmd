@@ -38,6 +38,8 @@ import {
   type BreakPoint,
   type CodeFenceRegion,
   reciprocalRankFusion,
+  resolveDirRrfWeight,
+  applyDirRrfWeight,
   extractSnippet,
   getCacheKey,
   normalizeVirtualPath,
@@ -1986,12 +1988,13 @@ describe("Snippet Extraction", () => {
 // =============================================================================
 
 describe("Reciprocal Rank Fusion", () => {
-  const makeResult = (file: string, score: number): RankedResult => ({
+  const makeResult = (file: string, score: number, kind?: RankedResult["kind"]): RankedResult => ({
     file,
     displayPath: file,
     title: file,
     body: "body",
     score,
+    ...(kind ? { kind } : {}),
   });
 
   test("RRF combines single list correctly", () => {
@@ -2061,6 +2064,68 @@ describe("Reciprocal Rank Fusion", () => {
 
     // Lower k = higher scores for top ranks
     expect(fused30[0]!.score).toBeGreaterThan(fused60[0]!.score);
+  });
+
+  test("resolveDirRrfWeight reads env with clamp", () => {
+    const prev = process.env.QMD_DIR_RRF_WEIGHT;
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      delete process.env.QMD_DIR_RRF_WEIGHT;
+      expect(resolveDirRrfWeight()).toBe(0.5);
+
+      process.env.QMD_DIR_RRF_WEIGHT = "";
+      expect(resolveDirRrfWeight()).toBe(0.5);
+
+      process.env.QMD_DIR_RRF_WEIGHT = "1";
+      expect(resolveDirRrfWeight()).toBe(1);
+
+      process.env.QMD_DIR_RRF_WEIGHT = "0";
+      expect(resolveDirRrfWeight()).toBe(0);
+
+      process.env.QMD_DIR_RRF_WEIGHT = "0.5";
+      expect(resolveDirRrfWeight()).toBe(0.5);
+
+      err.mockClear();
+      process.env.QMD_DIR_RRF_WEIGHT = "2";
+      expect(resolveDirRrfWeight()).toBe(0.5);
+      expect(err).toHaveBeenCalled();
+
+      err.mockClear();
+      process.env.QMD_DIR_RRF_WEIGHT = "nope";
+      expect(resolveDirRrfWeight()).toBe(0.5);
+      expect(err).toHaveBeenCalled();
+    } finally {
+      err.mockRestore();
+      if (prev === undefined) delete process.env.QMD_DIR_RRF_WEIGHT;
+      else process.env.QMD_DIR_RRF_WEIGHT = prev;
+    }
+  });
+
+  test("applyDirRrfWeight demotes dirs in mix only", () => {
+    const prev = process.env.QMD_DIR_RRF_WEIGHT;
+    const fused = [
+      makeResult("folder", 0.2, "dir"),
+      makeResult("doc.md", 0.15, "file"),
+    ];
+    try {
+      process.env.QMD_DIR_RRF_WEIGHT = "0.5";
+      const mixed = applyDirRrfWeight(fused);
+      expect(mixed[0]!.file).toBe("doc.md");
+      expect(mixed[1]!.file).toBe("folder");
+      expect(fused[0]!.file).toBe("folder");
+      expect(fused[0]!.score).toBe(0.2);
+
+      const asDir = applyDirRrfWeight(fused, "dir");
+      expect(asDir[0]!.file).toBe("folder");
+      expect(asDir[0]!.score).toBe(0.2);
+
+      process.env.QMD_DIR_RRF_WEIGHT = "1";
+      const identity = applyDirRrfWeight(fused);
+      expect(identity[0]!.file).toBe("folder");
+    } finally {
+      if (prev === undefined) delete process.env.QMD_DIR_RRF_WEIGHT;
+      else process.env.QMD_DIR_RRF_WEIGHT = prev;
+    }
   });
 });
 
