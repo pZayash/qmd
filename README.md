@@ -297,7 +297,7 @@ collection to use contract files at `.qmd/l0/<relpath>.md`; default `n` is extra
 only (direct children plus `Ext` files / `Forms` / `Commands` / `Templates` dir names). Seed missing files with
 `qmd l0 seed qmd://col/dir` or `qmd l0 seed --all -c col` (skips existing). After
 `update`, run `embed`. Query hits include `kind: "dir"`. Set `QMD_DIR_NODES=0` to hide dir hits.
-Mix `query` (no `--kind`) scales dir RRF scores by `QMD_DIR_RRF_WEIGHT` (default `0.5`; `1.0` = off). Restart the MCP daemon after changing the env.
+Mix `query` (no `--kind`) scales dir RRF scores by `QMD_DIR_RRF_WEIGHT` (default `0.5`; `1.0` = off). `query --explain` adds ancestor dir-node path-stack and, on dir hits, `dirWeight`. Restart the MCP daemon after changing the env or upgrading.
 
 #### Context
 
@@ -725,7 +725,7 @@ qmd query "user authentication"
 --min-score <num>  # Minimum score threshold (default: 0)
 --full             # Show full document content
 --line-numbers     # Add line numbers to output
---explain          # Include retrieval score traces (query, JSON/CLI output)
+--explain          # Retrieval traces: RRF, ancestor dir-node path-stack, dirWeight on dir hits
 --index <name>     # Use named index
 
 # Output formats (for search and multi-get)
@@ -815,7 +815,7 @@ qmd search --md --full "error handling"
 # JSON output for scripting
 qmd query --json "quarterly reports"
 
-# Inspect how each result was scored (RRF + rerank blend)
+# Inspect how each result was scored (RRF + path-stack of ancestor dir-nodes)
 qmd query --json --explain "quarterly reports"
 
 # Use separate index for different knowledge base

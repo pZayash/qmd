@@ -1191,6 +1191,44 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(json.result.content[0].type).toBe("text");
   });
 
+  test("POST /mcp tools/call query explain includes pathStack", async () => {
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 4, method: "tools/call",
+      params: {
+        name: "query",
+        arguments: { searches: [{ type: "lex", query: "readme" }], rerank: false, explain: true },
+      },
+    });
+    expect(status).toBe(200);
+    const results = json.result.structuredContent?.results ?? [];
+    expect(results.length).toBeGreaterThan(0);
+    expect(Array.isArray(results[0].explain?.pathStack)).toBe(true);
+  });
+
+  test("POST /mcp tools/call query without explain omits explain object", async () => {
+    await mcpRequest({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "test", version: "1.0" } },
+    });
+
+    const { status, json } = await mcpRequest({
+      jsonrpc: "2.0", id: 6, method: "tools/call",
+      params: {
+        name: "query",
+        arguments: { searches: [{ type: "lex", query: "readme" }], rerank: false },
+      },
+    });
+    expect(status).toBe(200);
+    const results = json.result.structuredContent?.results ?? [];
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].explain).toBeUndefined();
+  });
+
   test("POST /mcp tools/call query path scopes to prefix", async () => {
     await mcpRequest({
       jsonrpc: "2.0", id: 1, method: "initialize",
@@ -1234,6 +1272,37 @@ describe.skipIf(!!process.env.CI)("MCP HTTP Transport", () => {
     expect(body.results.every((r: { kind: string }) => r.kind === "file")).toBe(true);
     expect(body.results.every((r: { file: string }) => r.file.toLowerCase().includes("meetings/"))).toBe(true);
     expect(body.results.some((r: { file: string }) => r.file.toLowerCase().includes("readme.md"))).toBe(false);
+  });
+
+  test("POST /query explain includes pathStack", async () => {
+    const res = await fetch(`${baseUrl}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        searches: [{ type: "lex", query: "readme" }],
+        rerank: false,
+        explain: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.results.length).toBeGreaterThan(0);
+    expect(Array.isArray(body.results[0].explain.pathStack)).toBe(true);
+  });
+
+  test("POST /query without explain omits explain object", async () => {
+    const res = await fetch(`${baseUrl}/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        searches: [{ type: "lex", query: "readme" }],
+        rerank: false,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.results.length).toBeGreaterThan(0);
+    expect(body.results[0].explain).toBeUndefined();
   });
 
   test("POST /query invalid kind is 400", async () => {

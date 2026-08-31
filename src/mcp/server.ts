@@ -30,6 +30,7 @@ import {
   type ExpandedQuery,
   type IndexStatus,
   type HybridQueryResult,
+  type HybridQueryExplain,
   type SearchResult,
   parseDocumentKind,
 } from "../index.js";
@@ -70,6 +71,7 @@ type SearchResultItem = {
   context: string | null;
   snippet: string;
   kind: "file" | "dir";
+  explain?: HybridQueryExplain;
 };
 
 type StatusResult = {
@@ -385,9 +387,12 @@ After a \`kind: dir\` hit: \`get\` the dir-node L0, then \`query\` again with \`
         rerank: z.boolean().optional().default(true).describe(
           "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
+        explain: z.boolean().optional().describe(
+          "Include retrieval traces: ancestor dir-node path-stack, RRF contributions, and on dir hits dirWeight / scoreAfterDirWeight."
+        ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, path, kind, intent, rerank }) => {
+    async ({ searches, limit, minScore, candidateLimit, collections, path, kind, intent, rerank, explain }) => {
       // Map to internal format
       const queries: ExpandedQuery[] = searches.map(s => ({
         type: s.type,
@@ -406,6 +411,7 @@ After a \`kind: dir\` hit: \`get\` the dir-node L0, then \`query\` again with \`
         rerank,
         intent,
         kind,
+        explain: !!explain,
       });
 
       // Use first lex or vec query for snippet extraction
@@ -424,6 +430,7 @@ After a \`kind: dir\` hit: \`get\` the dir-node L0, then \`query\` again with \`
           context: r.context,
           snippet: addLineNumbers(snippet, line),
           kind: r.kind,
+          ...(r.explain ? { explain: r.explain } : {}),
         };
       });
 
@@ -1221,6 +1228,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           minScore: params.minScore ?? 0,
           intent: params.intent,
           kind,
+          explain: !!params.explain,
           ...(typeof params.rerank === "boolean" ? { rerank: params.rerank } : {}),
         });
 
@@ -1239,6 +1247,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
             context: r.context,
             snippet: addLineNumbers(snippet, line),
             kind: r.kind,
+            ...(r.explain ? { explain: r.explain } : {}),
           };
         });
 

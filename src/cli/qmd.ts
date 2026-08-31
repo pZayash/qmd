@@ -2450,6 +2450,16 @@ function outputResults(results: OutputRow[], query: string, opts: OutputOptions)
         if (contribSummary.length > 0) {
           console.log(`${c.dim}  Top RRF contributions: ${contribSummary}${c.reset}`);
         }
+        const stackSummary = (explain.pathStack ?? []).length > 0
+          ? explain.pathStack.map(e => {
+              const rank = e.inCandidates && e.rrfRank != null ? ` rrfRank=${e.rrfRank}` : "";
+              return `${e.path} inCandidates=${e.inCandidates}${rank}`;
+            }).join(" | ")
+          : "(none)";
+        console.log(`${c.dim}  Path stack: ${stackSummary}${c.reset}`);
+        if (explain.dirWeight != null && explain.scoreAfterDirWeight != null) {
+          console.log(`${c.dim}  Dir weight: ${formatExplainNumber(explain.dirWeight)} scoreAfter=${formatExplainNumber(explain.scoreAfterDirWeight)}${c.reset}`);
+        }
       }
       console.log();
 
@@ -3416,7 +3426,7 @@ function showHelp(): void {
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
   console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
   console.log("  --line-numbers             - Include line numbers in output");
-  console.log("  --explain                  - Include retrieval score traces (query --json/CLI)");
+  console.log("  --explain                  - Retrieval traces: RRF, path-stack of ancestor dir-nodes, dirWeight on dir hits");
   console.log("  --files | --json | --csv | --md | --xml  - Output format");
   console.log("  -c, --collection <name>    - Filter by one or more collections");
   console.log("  --path <prefix>            - Restrict to collection-relative path prefix; repeatable (OR)");

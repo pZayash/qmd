@@ -1481,6 +1481,12 @@ export function resolveDirRrfWeight(): number {
   return DEFAULT_DIR_RRF_WEIGHT;
 }
 
+/** Multiplier actually applied: identity when kind filter is set. */
+export function appliedDirRrfWeight(kind?: DocumentKind): number {
+  if (kind === "file" || kind === "dir") return 1;
+  return resolveDirRrfWeight();
+}
+
 /** SQL kind predicate: undefined = mix; empty = no rows; file/dir = constrain. */
 export function resolveRetrievalKind(kind?: DocumentKind): DocumentKind | "empty" | undefined {
   if (dirNodesDisabled()) {
@@ -2592,6 +2598,13 @@ export type RRFScoreTrace = {
   totalScore: number;      // baseScore + topRankBonus
 };
 
+export type ExplainPathStackEntry = {
+  path: string;
+  kind: "dir";
+  inCandidates: boolean;
+  rrfRank?: number;
+};
+
 export type HybridQueryExplain = {
   ftsScores: number[];
   vectorScores: number[];
@@ -2606,6 +2619,9 @@ export type HybridQueryExplain = {
   };
   rerankScore: number;
   blendedScore: number;
+  pathStack: ExplainPathStackEntry[];
+  dirWeight?: number;
+  scoreAfterDirWeight?: number;
 };
 
 /**
@@ -4976,6 +4992,114 @@ export function applyDirRrfWeight(fused: RankedResult[], kind?: DocumentKind): R
     .sort((a, b) => b.score - a.score);
 }
 
+const EMPTY_DIR_REL_PATHS: ReadonlySet<string> = new Set();
+
+/** 1-indexed ranks in the fused list after dir-weight, before candidateLimit. */
+export function fusedRankByFile(fused: RankedResult[]): Map<string, number> {
+  return new Map(fused.map((r, i) => [r.file, i + 1]));
+}
+
+/**
+ * Ancestor dir-nodes of a query hit. `hitFile` is `qmd://collection/relpath`.
+ * Only paths with an active dir-node in `activeDirRelPaths` are included.
+ */
+export function buildExplainPathStack(
+  hitFile: string,
+  activeDirRelPaths: ReadonlySet<string>,
+  fusedRankByVirtualFile: ReadonlyMap<string, number>,
+): ExplainPathStackEntry[] {
+  const parsed = parseVirtualPath(hitFile);
+  const rel = (parsed?.path ?? hitFile.replace(/^qmd:\/\/[^/]+\//, ""))
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "");
+  const collectionName = parsed?.collectionName;
+  const stack: ExplainPathStackEntry[] = [];
+  for (const dir of ancestorDirPaths(rel)) {
+    if (!activeDirRelPaths.has(dir)) continue;
+    const dirFile = collectionName ? buildVirtualPath(collectionName, dir) : dir;
+    const rrfRank = fusedRankByVirtualFile.get(dirFile);
+    stack.push({
+      path: dir,
+      kind: "dir",
+      inCandidates: rrfRank != null,
+      ...(rrfRank != null ? { rrfRank } : {}),
+    });
+  }
+  return stack;
+}
+
+type ExplainAttachContext = {
+  fusedRankByFile: Map<string, number>;
+  activeDirCache: Map<string, Set<string>>;
+  db: Database;
+  kindFilter?: DocumentKind;
+};
+
+function activeDirsForHit(ctx: ExplainAttachContext, hitFile: string): ReadonlySet<string> {
+  const collectionName = parseVirtualPath(hitFile)?.collectionName;
+  if (!collectionName) return EMPTY_DIR_REL_PATHS;
+  let set = ctx.activeDirCache.get(collectionName);
+  if (!set) {
+    set = new Set(getActiveDirPaths(ctx.db, collectionName));
+    ctx.activeDirCache.set(collectionName, set);
+  }
+  return set;
+}
+
+function composeHybridExplain(args: {
+  hitFile: string;
+  hitKind: DocumentKind;
+  fusedScore: number;
+  trace: RRFScoreTrace | undefined;
+  rrfRank: number;
+  rrfWeight: number;
+  rerankScore: number;
+  blendedScore: number;
+  ctx: ExplainAttachContext;
+}): HybridQueryExplain {
+  const explain: HybridQueryExplain = {
+    ftsScores: args.trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
+    vectorScores: args.trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
+    rrf: {
+      rank: args.rrfRank,
+      positionScore: 1 / args.rrfRank,
+      weight: args.rrfWeight,
+      baseScore: args.trace?.baseScore ?? 0,
+      topRankBonus: args.trace?.topRankBonus ?? 0,
+      totalScore: args.trace?.totalScore ?? 0,
+      contributions: args.trace?.contributions ?? [],
+    },
+    rerankScore: args.rerankScore,
+    blendedScore: args.blendedScore,
+    pathStack: buildExplainPathStack(
+      args.hitFile,
+      activeDirsForHit(args.ctx, args.hitFile),
+      args.ctx.fusedRankByFile,
+    ),
+  };
+  if (args.hitKind === "dir") {
+    explain.dirWeight = appliedDirRrfWeight(args.ctx.kindFilter);
+    explain.scoreAfterDirWeight = args.fusedScore;
+  }
+  return explain;
+}
+
+function createExplainAttachContext(
+  explain: boolean,
+  fused: RankedResult[],
+  db: Database,
+  kind?: DocumentKind,
+): ExplainAttachContext | undefined {
+  if (!explain) return undefined;
+  return {
+    fusedRankByFile: fusedRankByFile(fused),
+    activeDirCache: new Map(),
+    db,
+    kindFilter: kind,
+  };
+}
+
 /**
  * Build per-document RRF contribution traces for explain/debug output.
  */
@@ -5720,6 +5844,7 @@ export async function hybridQuery(
   const weights = rankedLists.map((_, i) => i < 2 ? 2.0 : 1.0);
   const fused = applyDirRrfWeight(reciprocalRankFusion(rankedLists, weights), kind);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
+  const explainCtx = createExplainAttachContext(explain, fused, store.db, kind);
   const candidates = fused.slice(0, candidateLimit);
 
   if (candidates.length === 0) return [];
@@ -5762,22 +5887,17 @@ export async function hybridQuery(
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
-        const trace = rrfTraceByFile?.get(cand.file);
-        const explainData: HybridQueryExplain | undefined = explain ? {
-          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
-          rrf: {
-            rank: rrfRank,
-            positionScore: rrfScore,
-            weight: 1.0,
-            baseScore: trace?.baseScore ?? 0,
-            topRankBonus: trace?.topRankBonus ?? 0,
-            totalScore: trace?.totalScore ?? 0,
-            contributions: trace?.contributions ?? [],
-          },
+        const explainData = explainCtx ? composeHybridExplain({
+          hitFile: cand.file,
+          hitKind: cand.kind ?? "file",
+          fusedScore: cand.score,
+          trace: rrfTraceByFile?.get(cand.file),
+          rrfRank,
+          rrfWeight: 1.0,
           rerankScore: 0,
           blendedScore: rrfScore,
-        } : undefined;
+          ctx: explainCtx,
+        }) : undefined;
 
         return {
           file: cand.file,
@@ -5821,7 +5941,7 @@ export async function hybridQuery(
   // Step 7: Blend RRF position score with reranker score
   // Position-aware weights: top retrieval results get more protection from reranker disagreement
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body, kind: c.kind,
+    displayPath: c.displayPath, title: c.title, body: c.body, kind: c.kind, fusedScore: c.score,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -5839,22 +5959,17 @@ export async function hybridQuery(
     const bestIdx = chunkInfo?.bestIdx ?? 0;
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
-    const trace = rrfTraceByFile?.get(r.file);
-    const explainData: HybridQueryExplain | undefined = explain ? {
-      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
-      rrf: {
-        rank: rrfRank,
-        positionScore: rrfScore,
-        weight: rrfWeight,
-        baseScore: trace?.baseScore ?? 0,
-        topRankBonus: trace?.topRankBonus ?? 0,
-        totalScore: trace?.totalScore ?? 0,
-        contributions: trace?.contributions ?? [],
-      },
+    const explainData = explainCtx ? composeHybridExplain({
+      hitFile: r.file,
+      hitKind: candidate?.kind ?? "file",
+      fusedScore: candidate?.fusedScore ?? 0,
+      trace: rrfTraceByFile?.get(r.file),
+      rrfRank,
+      rrfWeight,
       rerankScore: r.score,
       blendedScore,
-    } : undefined;
+      ctx: explainCtx,
+    }) : undefined;
 
     return {
       file: r.file,
@@ -6127,6 +6242,7 @@ export async function structuredSearch(
   const weights = rankedLists.map((_, i) => i === 0 ? 2.0 : 1.0);
   const fused = applyDirRrfWeight(reciprocalRankFusion(rankedLists, weights), kind);
   const rrfTraceByFile = explain ? buildRrfTrace(rankedLists, weights, rankedListMeta) : null;
+  const explainCtx = createExplainAttachContext(explain, fused, store.db, kind);
   const candidates = fused.slice(0, candidateLimit);
 
   if (candidates.length === 0) return [];
@@ -6174,22 +6290,17 @@ export async function structuredSearch(
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
-        const trace = rrfTraceByFile?.get(cand.file);
-        const explainData: HybridQueryExplain | undefined = explain ? {
-          ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-          vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
-          rrf: {
-            rank: rrfRank,
-            positionScore: rrfScore,
-            weight: 1.0,
-            baseScore: trace?.baseScore ?? 0,
-            topRankBonus: trace?.topRankBonus ?? 0,
-            totalScore: trace?.totalScore ?? 0,
-            contributions: trace?.contributions ?? [],
-          },
+        const explainData = explainCtx ? composeHybridExplain({
+          hitFile: cand.file,
+          hitKind: cand.kind ?? "file",
+          fusedScore: cand.score,
+          trace: rrfTraceByFile?.get(cand.file),
+          rrfRank,
+          rrfWeight: 1.0,
           rerankScore: 0,
           blendedScore: rrfScore,
-        } : undefined;
+          ctx: explainCtx,
+        }) : undefined;
 
         return {
           file: cand.file,
@@ -6232,7 +6343,7 @@ export async function structuredSearch(
 
   // Step 6: Blend RRF position score with reranker score
   const candidateMap = new Map(candidates.map(c => [c.file, {
-    displayPath: c.displayPath, title: c.title, body: c.body, kind: c.kind,
+    displayPath: c.displayPath, title: c.title, body: c.body, kind: c.kind, fusedScore: c.score,
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
@@ -6250,22 +6361,17 @@ export async function structuredSearch(
     const bestIdx = chunkInfo?.bestIdx ?? 0;
     const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
     const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
-    const trace = rrfTraceByFile?.get(r.file);
-    const explainData: HybridQueryExplain | undefined = explain ? {
-      ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
-      vectorScores: trace?.contributions.filter(c => c.source === "vec").map(c => c.backendScore) ?? [],
-      rrf: {
-        rank: rrfRank,
-        positionScore: rrfScore,
-        weight: rrfWeight,
-        baseScore: trace?.baseScore ?? 0,
-        topRankBonus: trace?.topRankBonus ?? 0,
-        totalScore: trace?.totalScore ?? 0,
-        contributions: trace?.contributions ?? [],
-      },
+    const explainData = explainCtx ? composeHybridExplain({
+      hitFile: r.file,
+      hitKind: candidate?.kind ?? "file",
+      fusedScore: candidate?.fusedScore ?? 0,
+      trace: rrfTraceByFile?.get(r.file),
+      rrfRank,
+      rrfWeight,
       rerankScore: r.score,
       blendedScore,
-    } : undefined;
+      ctx: explainCtx,
+    }) : undefined;
 
     return {
       file: r.file,

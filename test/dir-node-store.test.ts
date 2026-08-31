@@ -12,6 +12,7 @@ import {
   findDocument,
   dirNodesDisabled,
   upsertStoreCollection,
+  structuredSearch,
   type Store,
 } from "../src/store.js";
 
@@ -107,6 +108,49 @@ describe("dir-node store integration", () => {
     const hits = searchFTS(store.db, "uniqueDirToken", 10, collectionName);
     expect(hits.some(h => h.kind === "file")).toBe(true);
     expect(hits.some(h => h.kind === "dir")).toBe(true);
+  });
+
+  test("query explain path-stack for file and dir hits", async () => {
+    const prev = process.env.QMD_DIR_RRF_WEIGHT;
+    delete process.env.QMD_DIR_RRF_WEIGHT;
+    try {
+      const results = await structuredSearch(store, [{ type: "lex", query: "uniqueDirToken" }], {
+        collections: [collectionName],
+        skipRerank: true,
+        explain: true,
+      });
+      expect(results.length).toBeGreaterThan(0);
+
+      const fileHit = results.find(r => r.kind === "file" && r.file.endsWith("/docs/ai/one.md"));
+      expect(fileHit?.explain?.pathStack.map(e => e.path)).toEqual(["docs", "docs/ai"]);
+      expect(fileHit?.explain?.dirWeight).toBeUndefined();
+      const ai = fileHit?.explain?.pathStack.find(e => e.path === "docs/ai");
+      expect(ai?.kind).toBe("dir");
+      expect(typeof ai?.inCandidates).toBe("boolean");
+      if (ai?.inCandidates) expect(ai.rrfRank).toBeGreaterThan(0);
+      else expect(ai?.rrfRank).toBeUndefined();
+
+      const dirHit = results.find(r => r.kind === "dir" && r.file.endsWith("/docs/ai"));
+      expect(dirHit).toBeDefined();
+      expect(dirHit!.explain!.pathStack.map(e => e.path)).toEqual(["docs"]);
+      expect(dirHit!.explain!.dirWeight).toBe(0.5);
+      expect(typeof dirHit!.explain!.scoreAfterDirWeight).toBe("number");
+    } finally {
+      if (prev === undefined) delete process.env.QMD_DIR_RRF_WEIGHT;
+      else process.env.QMD_DIR_RRF_WEIGHT = prev;
+    }
+  });
+
+  test("query explain kind dir reports identity dirWeight", async () => {
+    const results = await structuredSearch(store, [{ type: "lex", query: "uniqueDirToken" }], {
+      collections: [collectionName],
+      kind: "dir",
+      skipRerank: true,
+      explain: true,
+    });
+    const dirHit = results.find(r => r.kind === "dir");
+    expect(dirHit?.explain?.dirWeight).toBe(1);
+    expect(dirHit?.explain?.pathStack.map(e => e.path)).toEqual(["docs"]);
   });
 
   test("reindexCollection onProgress reports file then dir phase", async () => {

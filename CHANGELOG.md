@@ -37,6 +37,10 @@
   `QMD_DIR_RRF_WEIGHT` (default `0.5`, clamp `[0, 1]`, `1.0` = off) before
   `-C`. `--kind dir` is unweighted. Not `search`/`vsearch`. Restart MCP daemon
   to pick up the env.
+- `qmd query --explain` (and MCP/REST `query` with `explain: true`) adds a
+  path-stack of ancestor dir-nodes (`inCandidates` / `rrfRank` from the fused
+  list after dir-weight, before `-C`) and, on dir hits, `dirWeight` plus
+  `scoreAfterDirWeight`. Restart MCP daemon. No index rebuild.
 
 - Added: `QMD_EMBED_CONCURRENCY` for parallel OpenRouter embedding with 429
   backoff and abort propagation (local llama path unchanged).

@@ -50,6 +50,7 @@ qmd mcp stop                      # Stop background MCP daemon
 - **`qmd search`** — BM25 (FTS) on indexed files only: pass **plain keywords** (phrases in `"quotes"`, `-negation` per FTS lexer). A single leading **`lex:`** is stripped for convenience (same as keywords after it); **`vec:`** / **`hyde:`** are not structured here — use **`qmd query`**.
 - **`qmd vsearch`** — vector similarity only (no rerank stage like `query`).
 - **Latency** — `qmd query --no-rerank` and `-C <n>` / `--candidate-limit` reduce rerank cost; wide `query` + full rerank can be tens of seconds on CPU.
+- **`--explain`** — `qmd query --explain` (JSON and TTY) and MCP/REST `query` with `explain: true`: RRF traces plus `pathStack` of ancestor dir-nodes (active L0 only) with `inCandidates`/`rrfRank` from the fused list after dir-weight, before `-C`. Dir hits also get `dirWeight` and `scoreAfterDirWeight`. Restart MCP daemon after upgrade.
 - **Path filter** — `--path <prefix>` restricts results to a collection-relative path prefix without creating separate collections. Repeatable (OR logic). Filtering is at SQL level (`LIKE prefix%`) — no cost when omitted. Works with `query`, `search`, `vsearch`. Leading `/` is stripped automatically.
 
   ```sh
