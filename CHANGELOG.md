@@ -4,6 +4,7 @@
 
 ### Features
 
+<<<<<<< HEAD
 - Directory **dir-nodes**: on `qmd update`, build searchable L0 summaries per folder
   that contains indexed files; `qmd query` / FTS / vec can return `kind: dir` hits.
   Config `l0_source`: `n` (extractive only) or `p` (read `.qmd/l0/<relpath>.md` when
@@ -41,6 +42,10 @@
   path-stack of ancestor dir-nodes (`inCandidates` / `rrfRank` from the fused
   list after dir-weight, before `-C`) and, on dir hits, `dirWeight` plus
   `scoreAfterDirWeight`. Restart MCP daemon. No index rebuild.
+- `qmd collection set-path <name> <new-root>` remaps a collection filesystem
+  root in YAML + SQLite without reindexing or re-embedding.
+- HTTP MCP listen address: `qmd mcp --http --host <addr>` and `QMD_HOST`
+  (default remains `127.0.0.1`). Non-loopback bind warns: no HTTP auth yet.
 
 - Added: `QMD_EMBED_CONCURRENCY` for parallel OpenRouter embedding with 429
   backoff and abort propagation (local llama path unchanged).

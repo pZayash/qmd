@@ -6,7 +6,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, resolve } from "path";
 import { homedir } from "os";
 import YAML from "yaml";
 import { resolveL0Source, type L0Source } from "./dir-node.js";
@@ -429,6 +429,21 @@ export function renameCollection(oldName: string, newName: string): boolean {
 
   config.collections[newName] = config.collections[oldName];
   delete config.collections[oldName];
+  saveConfig(config);
+  return true;
+}
+
+/**
+ * Remap a collection's filesystem root. Does not reindex or drop documents.
+ */
+export function setCollectionPath(name: string, newRoot: string): boolean {
+  const config = loadConfig();
+
+  if (!config.collections[name]) {
+    return false;
+  }
+
+  config.collections[name].path = resolve(newRoot);
   saveConfig(config);
   return true;
 }

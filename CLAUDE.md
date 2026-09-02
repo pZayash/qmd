@@ -18,6 +18,7 @@ qmd collection add . --name <n>   # Create/index collection
 qmd collection list               # List all collections with details
 qmd collection remove <name>      # Remove a collection by name
 qmd collection rename <old> <new> # Rename a collection
+qmd collection set-path <n> <root> # Remap collection filesystem root (no re-embed)
 qmd ls [collection[/path]]        # List collections or files in a collection
 qmd l0 seed <path> | --all        # Seed missing .qmd/l0 contracts from extractive L0
 qmd context add [path] "text"     # Add context for path (defaults to current dir)
@@ -39,10 +40,15 @@ qmd query <query>                 # Search with query expansion + reranking (rec
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)
 qmd mcp                           # Start MCP server (stdio transport)
-qmd mcp --http [--port N]         # Start MCP server (HTTP, default port 8181)
+qmd mcp --http [--port N] [--host ADDR]  # HTTP MCP (default 127.0.0.1:8181)
 qmd mcp --http --daemon           # Start as background daemon
 qmd mcp stop                      # Stop background MCP daemon
 ```
+
+**TODO (security, warn the developer):** HTTP MCP has **no auth**. Listen is
+`127.0.0.1` (`src/mcp/server.ts`). LAN bind without a token is incomplete.
+Firewall-only is a temporary v1. Do not silent-skip; dedicated change for
+bearer/token (or equivalent). See [AGENTS.md](AGENTS.md).
 
 ## Search vs query (agents)
 
@@ -85,6 +91,7 @@ qmd collection remove mynotes
 
 # Rename a collection
 qmd collection rename mynotes my-notes
+qmd collection set-path mynotes /new/root
 
 # List all files in a collection
 qmd ls mynotes

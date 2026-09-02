@@ -129,6 +129,7 @@ By default, QMD's MCP server uses stdio (launched as a subprocess by each client
 # Foreground (Ctrl-C to stop)
 qmd mcp --http                    # localhost:8181
 qmd mcp --http --port 8080        # custom port
+qmd mcp --http --host 0.0.0.0     # LAN bind (no HTTP auth — see TODO below)
 
 # Background daemon
 qmd mcp --http --daemon           # start, writes PID to ~/.cache/qmd/mcp.pid
@@ -143,6 +144,11 @@ The HTTP server exposes two endpoints:
 LLM models stay loaded in VRAM across requests. Embedding/reranking contexts are disposed after 5 min idle and transparently recreated on the next request (~1s penalty, models remain loaded).
 
 Point any MCP client at `http://localhost:8181/mcp` to connect.
+
+> **TODO (security):** HTTP MCP has **no authentication**. Default listen is
+> `127.0.0.1`. `--host 0.0.0.0` / `QMD_HOST` without a token is unsafe.
+> Do not treat a firewall as a substitute for auth. Agents: warn the
+> developer; see `AGENTS.md`.
 
 ### SDK / Library Usage
 

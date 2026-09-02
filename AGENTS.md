@@ -1,5 +1,14 @@
 # Agent Instructions
 
+## TODO: HTTP MCP auth (do not silent-skip)
+
+HTTP MCP (`qmd mcp --http`) has **no authentication**. Bind today is
+`127.0.0.1` only. LAN bind (`0.0.0.0` / `--host`) without a token is a
+security hole. If the task is MCP over the network, **warn the developer**
+and do not treat firewall-only as done. Implement bearer/token (or equivalent)
+in a dedicated change; do not ship LAN listen as “complete” without calling
+this out.
+
 ## Package manager
 
 - This project uses `pnpm`.

@@ -1086,11 +1086,32 @@ export type HttpServerHandle = {
   stop: () => Promise<void>;
 };
 
+const DEFAULT_MCP_LISTEN_HOST = "127.0.0.1";
+
+/** CLI `--host` wins, then `QMD_HOST`, then loopback. */
+export function resolveMcpListenHost(cliHost?: string, envHost?: string): string {
+  const cli = cliHost?.trim();
+  if (cli) return cli;
+  const env = (envHost !== undefined ? envHost : process.env.QMD_HOST)?.trim();
+  if (env) return env;
+  return DEFAULT_MCP_LISTEN_HOST;
+}
+
+export function isLoopbackMcpHost(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  return h === "127.0.0.1" || h === "::1" || h === "localhost";
+}
+
+export const MCP_HTTP_NO_AUTH_WARNING =
+  "WARNING: HTTP MCP has no authentication. LAN bind is incomplete until a token exists. See AGENTS.md.";
+
 /**
  * Start MCP server over Streamable HTTP (JSON responses, no SSE).
- * Binds to localhost only. Returns a handle for shutdown and port discovery.
+ * Default bind is loopback. Pass `host` (or `QMD_HOST`) for LAN listen.
+ * Returns a handle for shutdown and port discovery.
  */
-export async function startMcpHttpServer(port: number, options?: { quiet?: boolean }): Promise<HttpServerHandle> {
+export async function startMcpHttpServer(port: number, options?: { quiet?: boolean; host?: string }): Promise<HttpServerHandle> {
+  const host = options?.host ?? resolveMcpListenHost();
   const configPath = getConfigPath();
   const store = await createStore({
     dbPath: getDefaultDbPath(),
@@ -1369,7 +1390,13 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "127.0.0.1", () => resolve());
+    // TODO(security): HTTP MCP has no auth. 127.0.0.1 is intentional.
+    // LAN bind (0.0.0.0 / --host) is incomplete until bearer/token exists.
+    // Agents: warn the developer — do not silent-skip. See AGENTS.md.
+    if (!isLoopbackMcpHost(host)) {
+      console.error(MCP_HTTP_NO_AUTH_WARNING);
+    }
+    httpServer.listen(port, host, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
@@ -1397,7 +1424,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
     process.exit(0);
   });
 
-  log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  log(`QMD MCP server listening on http://${host}:${actualPort}/mcp`);
   return { httpServer, port: actualPort, stop };
 }
 

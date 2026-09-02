@@ -63,6 +63,8 @@ Add/update tests when behavior changes.
 - **Do not compile** with `bun build --compile` (breaks sqlite-vec wrapper)
 - **Index path**: `~/.cache/qmd/index.sqlite` — never edit SQLite directly
 - MCP daemon pins old code — restart after `dist/` changes
+- **HTTP MCP has no auth** (TODO). Bind is `127.0.0.1`. LAN listen without
+  a token is not “done”: warn the developer; implement auth in its own change
 
 ## OpenSpec CLI
 

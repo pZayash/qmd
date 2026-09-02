@@ -82,6 +82,7 @@ import {
   addCollection as collectionsAddCollection,
   removeCollection as collectionsRemoveCollection,
   renameCollection as collectionsRenameCollection,
+  setCollectionPath as collectionsSetCollectionPath,
   addContext as collectionsAddContext,
   removeContext as collectionsRemoveContext,
   setGlobalContext as collectionsSetGlobalContext,
@@ -277,6 +278,9 @@ export interface QMDStore {
 
   /** Rename a collection */
   renameCollection(oldName: string, newName: string): Promise<boolean>;
+
+  /** Remap a collection filesystem root without reindexing */
+  setCollectionPath(name: string, absPath: string): Promise<boolean>;
 
   /** List all collections with document stats */
   listCollections(): Promise<{ name: string; pwd: string; glob_pattern: string; doc_count: number; active_count: number; last_modified: string | null; includeByDefault: boolean }[]>;
@@ -502,6 +506,22 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         collectionsRenameCollection(oldName, newName);
       }
       return result;
+    },
+    setCollectionPath: async (name, absPath) => {
+      const existing = getStoreCollection(db, name);
+      if (!existing) return false;
+      upsertStoreCollection(db, name, {
+        path: absPath,
+        pattern: existing.pattern,
+        ignore: existing.ignore,
+        includeByDefault: existing.includeByDefault,
+        update: existing.update,
+        context: existing.context,
+      });
+      if (hasYamlConfig || options.config) {
+        collectionsSetCollectionPath(name, absPath);
+      }
+      return true;
     },
     listCollections: async () => storeListCollections(db),
     getDefaultCollectionNames: async () => {

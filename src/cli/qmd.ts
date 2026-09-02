@@ -113,6 +113,7 @@ import {
   removeContext as yamlRemoveContext,
   removeCollection as yamlRemoveCollectionFn,
   renameCollection as yamlRenameCollectionFn,
+  setCollectionPath as yamlSetCollectionPathFn,
   setGlobalContext,
   listAllContexts,
   setConfigIndexName,
@@ -1809,6 +1810,29 @@ function collectionRename(oldName: string, newName: string): void {
   console.log(`  Virtual paths updated: ${c.cyan}qmd://${oldName}/${c.reset} → ${c.cyan}qmd://${newName}/${c.reset}`);
 }
 
+function collectionSetPath(name: string, newRoot: string): void {
+  const coll = getCollectionFromYaml(name);
+  if (!coll) {
+    console.error(`${c.yellow}Collection not found: ${name}${c.reset}`);
+    console.error(`Run 'qmd collection list' to see available collections.`);
+    process.exit(1);
+  }
+
+  const resolved = resolve(newRoot);
+  if (!existsSync(resolved)) {
+    console.error(`${c.yellow}Destination path does not exist: ${resolved}${c.reset}`);
+    process.exit(1);
+  }
+
+  yamlSetCollectionPathFn(name, resolved);
+  getDb();
+  resyncConfig();
+  closeDb();
+
+  console.log(`${c.green}✓${c.reset} Set path for collection '${name}'`);
+  console.log(`  ${c.dim}${coll.path}${c.reset} → ${c.cyan}${resolved}${c.reset}`);
+}
+
 async function indexFiles(pwd?: string, globPattern: string = DEFAULT_GLOB, collectionName?: string, suppressEmbedNotice: boolean = false, ignorePatterns?: string[]): Promise<void> {
   const db = getDb();
   const resolvedPwd = pwd || getPwd();
@@ -2982,6 +3006,7 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      host: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -3765,6 +3790,16 @@ if (isMain) {
           break;
         }
 
+        case "set-path": {
+          if (!cli.args[1] || !cli.args[2]) {
+            console.error("Usage: qmd collection set-path <name> <new-root>");
+            console.error("  Use 'qmd collection list' to see available collections");
+            process.exit(1);
+          }
+          collectionSetPath(cli.args[1], cli.args[2]);
+          break;
+        }
+
         case "rename":
         case "mv": {
           if (!cli.args[1] || !cli.args[2]) {
@@ -3857,6 +3892,7 @@ if (isMain) {
           console.log("  add <path> [--name NAME]  Add a collection");
           console.log("  remove <name>             Remove a collection");
           console.log("  rename <old> <new>        Rename a collection");
+          console.log("  set-path <name> <root>    Remap collection root (no re-embed)");
           console.log("  show <name>               Show collection details");
           console.log("  update-cmd <name> [cmd]   Set pre-update command (e.g., 'git pull')");
           console.log("  include <name>            Include in default queries");
@@ -4014,6 +4050,8 @@ if (isMain) {
 
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
+        const { startMcpHttpServer, resolveMcpListenHost } = await import("../mcp/server.js");
+        const host = resolveMcpListenHost(cli.values.host as string | undefined);
 
         if (cli.values.daemon) {
           // Guard: check if already running
@@ -4033,8 +4071,8 @@ if (isMain) {
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
           const selfPath = fileURLToPath(import.meta.url);
           const spawnArgs = selfPath.endsWith(".ts")
-            ? ["--import", pathToFileURL(pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs")).href, selfPath, "mcp", "--http", "--port", String(port)]
-            : [selfPath, "mcp", "--http", "--port", String(port)];
+            ? ["--import", pathToFileURL(pathJoin(dirname(selfPath), "..", "..", "node_modules", "tsx", "dist", "esm", "index.mjs")).href, selfPath, "mcp", "--http", "--port", String(port), "--host", host]
+            : [selfPath, "mcp", "--http", "--port", String(port), "--host", host];
           const child = nodeSpawn(process.execPath, spawnArgs, {
             stdio: ["ignore", logFd, logFd],
             detached: true,
@@ -4044,7 +4082,7 @@ if (isMain) {
 
           writeFileSync(pidPath, String(child.pid));
           writeFileSync(portPath, String(port));
-          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
+          console.log(`Started on http://${host}:${port}/mcp (PID ${child.pid})`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
@@ -4053,9 +4091,8 @@ if (isMain) {
         // async cleanup handlers in startMcpHttpServer actually run.
         process.removeAllListeners("SIGTERM");
         process.removeAllListeners("SIGINT");
-        const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port);
+          await startMcpHttpServer(port, { host });
         } catch (e: any) {
           if (e?.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
