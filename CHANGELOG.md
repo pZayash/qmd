@@ -79,6 +79,12 @@
 
 ### Fixes
 
+- Windows CLI: daemon thin client no longer calls `process.exit()` right after
+  HTTP RPC. That aborted Node 24 with libuv `UV_HANDLE_CLOSING` (`src\win\async.c`)
+  — stdout was already correct, exit `-1073740791`. Loopback calls use
+  `http.request` with `agent: false`; success sets `process.exitCode` and drains.
+  Status MCP health ping uses the same client.
+
 - Launcher: treat `pnpm-lock.yaml` and `yarn.lock` like `package-lock.json` (route
   to Node). Repo ships `bun.lock` but installs via pnpm — without this, `qmd`
   exec'd `bun` when it was not on PATH. Bun-only checkouts fall back to Node when

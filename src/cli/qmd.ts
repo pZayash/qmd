@@ -2,6 +2,7 @@ import { openDatabase } from "../db.js";
 import type { Database } from "../db.js";
 import fastGlob from "fast-glob";
 import { execSync, spawn as nodeSpawn } from "child_process";
+import { request as httpRequest } from "node:http";
 import { fileURLToPath, pathToFileURL } from "url";
 import { dirname, join as pathJoin, relative as relativePath } from "path";
 import { parseArgs } from "util";
@@ -425,9 +426,9 @@ async function showStatus(): Promise<void> {
   if (existsSync(mcpPortPath)) {
     const mcpPort = parseInt(readFileSync(mcpPortPath, "utf-8").trim());
     try {
-      const h = await fetch(`http://127.0.0.1:${mcpPort}/health`, { signal: AbortSignal.timeout(500) });
+      const h = await loopbackHttp({ port: mcpPort, path: "/health", timeoutMs: 500 });
       if (h.ok) {
-        const info = await h.json() as { pid?: number };
+        const info = JSON.parse(h.text) as { pid?: number };
         const pid = info.pid ?? (existsSync(mcpPidPath) ? parseInt(readFileSync(mcpPidPath, "utf-8").trim()) : null);
         const pidSuffix = pid ? ` (PID ${pid})` : "";
         console.log(`MCP:   ${c.green}running${c.reset}${pidSuffix}  http://127.0.0.1:${mcpPort}/health`);
@@ -3506,9 +3507,71 @@ function isEligibleForDaemon(argv: string[]): boolean {
   return false;
 }
 
-async function tryDaemon(argv: string[]): Promise<void> {
-  if (!isEligibleForDaemon(argv)) return;
-  if (process.env.QMD_NO_DAEMON === "1") return;
+type LoopbackHttpResult = { ok: boolean; status: number; text: string };
+
+/**
+ * Loopback HTTP without undici keep-alive. `fetch()` + `process.exit()` on
+ * Windows Node 24 trips libuv `UV_HANDLE_CLOSING` (win/async.c) after stdout.
+ * `agent: false` so the client socket does not pin the event loop.
+ */
+function loopbackHttp(options: {
+  port: number;
+  path: string;
+  method?: string;
+  body?: string;
+  headers?: Record<string, string>;
+  timeoutMs: number;
+}): Promise<LoopbackHttpResult> {
+  const { port, path, method = "GET", body, headers, timeoutMs } = options;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (err: Error | null, result?: LoopbackHttpResult) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve(result!);
+    };
+    const req = httpRequest(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path,
+        method,
+        agent: false,
+        timeout: timeoutMs,
+        headers: {
+          ...(body ? { "Content-Length": String(Buffer.byteLength(body)) } : {}),
+          ...headers,
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => { chunks.push(chunk); });
+        res.on("end", () => {
+          const status = res.statusCode ?? 0;
+          finish(null, {
+            ok: status >= 200 && status < 300,
+            status,
+            text: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+        res.on("error", (err: Error) => finish(err));
+      },
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      finish(new Error("timeout"));
+    });
+    req.on("error", (err: Error) => finish(err));
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+/** @returns daemon RPC exit code, or null to run the command locally */
+async function tryDaemon(argv: string[]): Promise<number | null> {
+  if (!isEligibleForDaemon(argv)) return null;
+  if (process.env.QMD_NO_DAEMON === "1") return null;
 
   const daemonCacheDir = process.env.XDG_CACHE_HOME
     ? resolve(process.env.XDG_CACHE_HOME, "qmd")
@@ -3522,7 +3585,7 @@ async function tryDaemon(argv: string[]): Promise<void> {
     const savedPort = parseInt(readFileSync(portPath, "utf-8").trim());
     if (!isNaN(savedPort)) {
       try {
-        const h = await fetch(`http://127.0.0.1:${savedPort}/health`, { signal: AbortSignal.timeout(500) });
+        const h = await loopbackHttp({ port: savedPort, path: "/health", timeoutMs: 500 });
         if (h.ok) port = savedPort;
       } catch { /* not running */ }
     }
@@ -3559,29 +3622,31 @@ async function tryDaemon(argv: string[]): Promise<void> {
     let ready = false;
     while (Date.now() < deadline) {
       try {
-        const h = await fetch(`http://127.0.0.1:${defaultPort}/health`, { signal: AbortSignal.timeout(300) });
+        const h = await loopbackHttp({ port: defaultPort, path: "/health", timeoutMs: 300 });
         if (h.ok) { ready = true; break; }
       } catch { /* not up yet */ }
       await new Promise(r => setTimeout(r, 150));
     }
-    if (!ready) return; // failed to start → fall through to local execution
+    if (!ready) return null; // failed to start → fall through to local execution
     port = defaultPort;
   }
 
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/rpc`, {
-      method:  "POST",
+    const res = await loopbackHttp({
+      port,
+      path: "/rpc",
+      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ argv, cwd: process.cwd() }),
-      signal:  AbortSignal.timeout(60_000),
+      body: JSON.stringify({ argv, cwd: process.cwd() }),
+      timeoutMs: 60_000,
     });
-    if (!res.ok) return;
-    const { stdout, stderr, exitCode } = await res.json() as { stdout: string; stderr: string; exitCode: number };
+    if (!res.ok) return null;
+    const { stdout, stderr, exitCode } = JSON.parse(res.text) as { stdout: string; stderr: string; exitCode: number };
     if (stdout) process.stdout.write(stdout);
     if (stderr) process.stderr.write(stderr);
-    process.exit(exitCode);
+    return exitCode;
   } catch {
-    return; // daemon unreachable → fall through
+    return null; // daemon unreachable → fall through
   }
 }
 
@@ -3630,9 +3695,11 @@ if (isMain) {
     process.exit(cli.values.help ? 0 : 1);
   }
 
-  await tryDaemon(process.argv.slice(2));
-
-  switch (cli.command) {
+  const daemonExit = await tryDaemon(process.argv.slice(2));
+  if (daemonExit !== null) {
+    await disposeDefaultLlamaCpp();
+    process.exitCode = daemonExit;
+  } else switch (cli.command) {
     case "context": {
       const subcommand = cli.args[0];
       if (!subcommand) {
@@ -4184,9 +4251,9 @@ if (isMain) {
       process.exit(1);
   }
 
-  if (cli.command !== "mcp") {
+  if (daemonExit === null && cli.command !== "mcp") {
     await disposeDefaultLlamaCpp();
-    process.exit(0);
+    process.exitCode = 0;
   }
 
 } // end if (main module)
