@@ -66,6 +66,7 @@ import {
   type ReindexResult,
   type EmbedProgress,
   type EmbedResult,
+  type EmbedStopReason,
   type ChunkStrategy,
   type DocumentKind,
   parseDocumentKind,
@@ -113,6 +114,7 @@ export type {
   ReindexResult,
   EmbedProgress,
   EmbedResult,
+  EmbedStopReason,
   Collection,
   CollectionConfig,
   NamedCollection,
@@ -317,7 +319,9 @@ export interface QMDStore {
     onProgress?: (info: UpdateProgress) => void;
   }): Promise<UpdateResult>;
 
-  /** Generate vector embeddings for documents that need them */
+  /** Generate vector embeddings for documents that need them.
+   *  Result includes `stopReason` (`complete` | `session_timeout` | `error_rate`)
+   *  and `docsProcessed` = documents that received at least one insert this run. */
   embed(options?: {
     force?: boolean;
     model?: string;

@@ -248,4 +248,21 @@ describe("OpenRouterEmbedding concurrency", () => {
     expect(overlapping).toBe(false);
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
+
+  test("consumeRateLimitRetries counts 429 retries then resets", async () => {
+    vi.useFakeTimers();
+    fetchMock
+      .mockResolvedValueOnce(errResponse(429, "slow down", { "Retry-After": "1" }))
+      .mockImplementation((_url: string, init?: RequestInit) =>
+        Promise.resolve(batchOkResponse(parseInputs(init)))
+      );
+
+    const llm = new OpenRouterEmbedding(MODEL_URI, { apiKey: "k", batchSize: 10, concurrency: 1 });
+    const resultPromise = llm.embed(["only"]);
+    await vi.advanceTimersByTimeAsync(1500);
+    await resultPromise;
+
+    expect(llm.consumeRateLimitRetries()).toBeGreaterThanOrEqual(1);
+    expect(llm.consumeRateLimitRetries()).toBe(0);
+  });
 });

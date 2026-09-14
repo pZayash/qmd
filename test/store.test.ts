@@ -51,6 +51,7 @@ import {
   STRONG_SIGNAL_MIN_SCORE,
   STRONG_SIGNAL_MIN_GAP,
   generateEmbeddings,
+  insertEmbeddingBatch,
   reindexFiles,
   resolveIndexFilePaths,
   getHashesNeedingEmbedding,
@@ -3050,6 +3051,158 @@ describe("Embedding batching", () => {
         "sessionMaxDurationMs"
       );
     } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("insertEmbeddingBatch writes two hashes in one call", async () => {
+    const store = await createTestStore();
+    const now = new Date().toISOString();
+    const vec = new Float32Array([0.1, 0.2, 0.3]);
+    try {
+      store.ensureVecTable(3);
+      const hashA = "aaaaaaa1";
+      const hashB = "bbbbbbb2";
+      store.insertContent(hashA, "doc a", now);
+      store.insertContent(hashB, "doc b", now);
+      insertEmbeddingBatch(store.db, [
+        { hash: hashA, seq: 0, pos: 0, embedding: vec, model: "m", embeddedAt: now },
+        { hash: hashB, seq: 0, pos: 0, embedding: vec, model: "m", embeddedAt: now },
+      ]);
+      const count = store.db.prepare(`SELECT COUNT(*) as c FROM content_vectors`).get() as { c: number };
+      expect(count.c).toBe(2);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("insertEmbeddingBatch rolls back the whole step on throw", async () => {
+    // better-sqlite3 `db.transaction` rolls back on throw; we force a failure on
+    // the second row via an invalid embedding buffer after the first insert is queued.
+    const store = await createTestStore();
+    const now = new Date().toISOString();
+    const vec = new Float32Array([0.1, 0.2, 0.3]);
+    try {
+      store.ensureVecTable(3);
+      const hashA = "ccccccc1";
+      const hashB = "ddddddd2";
+      store.insertContent(hashA, "doc a", now);
+      store.insertContent(hashB, "doc b", now);
+      expect(() => {
+        insertEmbeddingBatch(store.db, [
+          { hash: hashA, seq: 0, pos: 0, embedding: vec, model: "m", embeddedAt: now },
+          { hash: hashB, seq: 0, pos: 0, embedding: null as unknown as Float32Array, model: "m", embeddedAt: now },
+        ]);
+      }).toThrow();
+      const count = store.db.prepare(`SELECT COUNT(*) as c FROM content_vectors`).get() as { c: number };
+      expect(count.c).toBe(0);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings feeds concurrency × batchSize texts per embedBatch", async () => {
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    fakeLlm.preferredEmbedBatchSize = 2;
+    (fakeLlm as { preferredEmbedConcurrency: number }).preferredEmbedConcurrency = 3;
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+    try {
+      for (let i = 0; i < 6; i++) {
+        await insertTestDocument(store.db, "docs", { name: `d${i}`, body: `# D${i}\n\nBody${i}` });
+      }
+      const result = await generateEmbeddings(store);
+      expect(fakeLlm.embedBatchCalls[0]?.length).toBe(6);
+      expect(result.chunksEmbedded).toBe(6);
+      expect(result.docsProcessed).toBe(6);
+      expect(result.stopReason).toBe("complete");
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings stamps distinct embedded_at across steps", async () => {
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    fakeLlm.preferredEmbedBatchSize = 1;
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+    let isoCalls = 0;
+    const isoSpy = vi.spyOn(Date.prototype, "toISOString").mockImplementation(function () {
+      isoCalls++;
+      return `2026-09-04T10:00:${String(isoCalls).padStart(2, "0")}.000Z`;
+    });
+    try {
+      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await insertTestDocument(store.db, "docs", { name: "two", body: "# Two\n\nBeta" });
+      await generateEmbeddings(store, { sessionMaxDurationMs: 0 });
+      const stamps = store.db.prepare(
+        `SELECT DISTINCT embedded_at as t FROM content_vectors ORDER BY t`
+      ).all() as { t: string }[];
+      expect(stamps.length).toBeGreaterThanOrEqual(2);
+      expect(stamps[0]!.t).not.toBe(stamps[1]!.t);
+    } finally {
+      isoSpy.mockRestore();
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings session timeout reports stopReason and partial docsProcessed", async () => {
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    fakeLlm.preferredEmbedBatchSize = 1;
+    let embedBatchCount = 0;
+    const originalEmbedBatch = fakeLlm.embedBatch.bind(fakeLlm);
+    fakeLlm.embedBatch = async (texts: string[], options?: { model?: string; signal?: AbortSignal }) => {
+      embedBatchCount++;
+      if (embedBatchCount >= 2) {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, 400);
+          options?.signal?.addEventListener("abort", () => {
+            clearTimeout(timer);
+            const err = new Error("aborted");
+            err.name = "AbortError";
+            reject(err);
+          }, { once: true });
+        });
+      }
+      return originalEmbedBatch(texts, options);
+    };
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+    try {
+      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await insertTestDocument(store.db, "docs", { name: "two", body: "# Two\n\nBeta" });
+      await insertTestDocument(store.db, "docs", { name: "three", body: "# Three\n\nGamma" });
+      const result = await generateEmbeddings(store, { sessionMaxDurationMs: 80 });
+      expect(result.stopReason).toBe("session_timeout");
+      expect(result.docsProcessed).toBeGreaterThanOrEqual(1);
+      expect(result.docsProcessed).toBeLessThan(3);
+      expect(result.chunksEmbedded).toBe(result.docsProcessed);
+    } finally {
+      setDefaultLlamaCpp(null);
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings writes [qmd embed] start and done lines", async () => {
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    setDefaultLlamaCpp(createFakeTokenizer() as any);
+    store.llm = fakeLlm as any;
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await insertTestDocument(store.db, "docs", { name: "one", body: "# One\n\nAlpha" });
+      await generateEmbeddings(store);
+      const lines = errSpy.mock.calls.map(c => String(c[0]));
+      expect(lines.some(l => l.startsWith("[qmd embed] start"))).toBe(true);
+      expect(lines.some(l => l.startsWith("[qmd embed] done") && l.includes("reason="))).toBe(true);
+    } finally {
+      errSpy.mockRestore();
       setDefaultLlamaCpp(null);
       await cleanupTestDb(store);
     }

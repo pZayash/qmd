@@ -428,6 +428,12 @@ export interface LLM {
   readonly preferredEmbedBatchSize?: number;
 
   /**
+   * OpenRouter POST pool size for one embedBatch. Omit or 1 = serial.
+   * Local node-llama-cpp omits this (store treats missing as 1).
+   */
+  readonly preferredEmbedConcurrency?: number;
+
+  /**
    * Dispose of resources
    */
   dispose(): Promise<void>;

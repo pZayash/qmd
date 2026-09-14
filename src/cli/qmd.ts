@@ -2130,6 +2130,9 @@ async function vectorIndex(
   } else {
     console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
     console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${result.chunksEmbedded}${c.reset} chunks from ${c.bold}${result.docsProcessed}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset}`);
+    if (result.stopReason !== "complete") {
+      console.error(`${c.yellow}⚠ Embed stopped (${result.stopReason})${c.reset}`);
+    }
     if (result.errors > 0) {
       console.log(`${c.yellow}⚠ ${result.errors} chunks failed${c.reset}`);
     }

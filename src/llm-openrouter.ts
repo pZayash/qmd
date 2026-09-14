@@ -191,6 +191,7 @@ export class OpenRouterEmbedding implements LLM {
   private readonly uri: string;
   private readonly batchSize: number;
   private readonly concurrency: number;
+  private rateLimitRetries = 0;
   // Ordered list tried in sequence: failover advances to the next endpoint only
   // on a transport-level failure (network error or HTTP 5xx/429), never on a 4xx
   // (those are config/auth bugs the fallback can't fix).
@@ -256,6 +257,17 @@ export class OpenRouterEmbedding implements LLM {
     return this.batchSize;
   }
 
+  get preferredEmbedConcurrency(): number {
+    return this.concurrency;
+  }
+
+  /** Read-and-reset count of HTTP 429 retries since the previous consume. */
+  consumeRateLimitRetries(): number {
+    const n = this.rateLimitRetries;
+    this.rateLimitRetries = 0;
+    return n;
+  }
+
   // POST to one endpoint. Throws on transport failure (network error / 5xx / 429)
   // so the caller can fail over; throws a terminal error on 4xx or a malformed
   // 200 body (failing over won't help those).
@@ -288,6 +300,7 @@ export class OpenRouterEmbedding implements LLM {
 
       if (resp.status === 429) {
         if (attempt < MAX_RATE_LIMIT_RETRIES) {
+          this.rateLimitRetries++;
           const delay = (parseRetryAfterMs(resp) ?? RATE_LIMIT_BASE_DELAY_MS * 2 ** attempt) + Math.random() * 250;
           embedDebug(`429 from ${ep.label}, retry ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES} after ${Math.round(delay)}ms`);
           await sleepWithAbort(delay, signal);

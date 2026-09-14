@@ -4,7 +4,11 @@
 
 ### Features
 
-<<<<<<< HEAD
+- `qmd embed`: durable `[qmd embed]` stderr throughput logs (`api_ms` / `sqlite_ms` /
+  rate / 429); insert-time `embedded_at`; transactional vector writes per store
+  step; store steps feed OpenRouter `QMD_EMBED_CONCURRENCY` (`batchSize × concurrency`
+  texts per `embedBatch`). Nightly long runs: `QMD_EMBED_SESSION_MAX_DURATION_SEC=0`.
+
 - Directory **dir-nodes**: on `qmd update`, build searchable L0 summaries per folder
   that contains indexed files; `qmd query` / FTS / vec can return `kind: dir` hits.
   Config `l0_source`: `n` (extractive only) or `p` (read `.qmd/l0/<relpath>.md` when
