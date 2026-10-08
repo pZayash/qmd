@@ -4385,6 +4385,45 @@ function sanitizeHyphenatedTerm(term: string): string {
  *   DEC-0054               → "dec 0054"
  *   -multi-agent            → NOT "multi agent"
  */
+/**
+ * Russian inflection suffixes for lex queries, longest first.
+ *
+ * FTS5's `porter` tokenizer is English-only: Russian words are indexed verbatim,
+ * so a query for "валюты" never matches "валюта"/"валютой". Query terms are
+ * already emitted as prefix queries (`"term"*`), so cutting the inflectional
+ * ending off the query term recovers most of the recall (measured on the кпср
+ * index: "валют"* 2355 hits vs "валюты"* 1109; "договор"* 2539 vs "договора"* 745).
+ *
+ * This is deliberately conservative — a stemmer, not a full snowball:
+ * Cyrillic tokens only, token >= 5 chars, stem >= 4 chars, no ё-folding
+ * (docs may contain either form). Disable with QMD_LEX_STEM=off.
+ */
+const RU_INFLECTION_SUFFIXES: readonly string[] = [
+  "иями", "ями", "ами", "ией", "иях", "иям", "ием", "ией", "ыми", "ими", "ого", "его", "ому", "ему",
+  "ать", "ить", "еть", "ыть", "уть", "ять", "ться", "ется", "ится", "ают", "ает", "ять",
+  "ая", "яя", "ое", "ее", "ые", "ие", "ых", "их", "ым", "им", "ой", "ей", "ий", "ый",
+  "ам", "ям", "ах", "ях", "ом", "ем", "ую", "юю", "ью", "ию", "ия", "ья", "ье", "ии",
+  "а", "я", "о", "е", "у", "ю", "ы", "и", "й", "ь",
+];
+
+const RU_SUFFIXES_BY_LENGTH = [...RU_INFLECTION_SUFFIXES].sort((a, b) => b.length - a.length);
+
+/**
+ * Trim a Russian inflectional ending from a lex query token.
+ * Returns the token unchanged for non-Cyrillic, short, or unlisted-form tokens.
+ */
+export function stemRussianQueryTerm(term: string): string {
+  if ((process.env.QMD_LEX_STEM ?? "ru").toLowerCase() === "off") return term;
+  if (term.length < 5 || !/[а-яё]/i.test(term)) return term;
+  const lower = term.toLowerCase();
+  for (const suffix of RU_SUFFIXES_BY_LENGTH) {
+    if (lower.endsWith(suffix) && lower.length - suffix.length >= 4) {
+      return term.slice(0, term.length - suffix.length);
+    }
+  }
+  return term;
+}
+
 function buildFTS5Query(query: string): string | null {
   const positive: string[] = [];
   const negative: string[] = [];
@@ -4449,7 +4488,7 @@ function buildFTS5Query(query: string): string | null {
           if (pruneNaturalLanguage && (sanitized.length < 3 || naturalLanguageStopwords.has(sanitized))) {
             continue;
           }
-          const ftsTerm = `"${sanitized}"*`;  // Prefix match
+          const ftsTerm = `"${stemRussianQueryTerm(sanitized)}"*`;  // Prefix match (Russian inflections trimmed)
           if (negated) {
             negative.push(ftsTerm);
           } else {
@@ -4542,48 +4581,43 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
 
-  // Use a CTE to force FTS5 to run first, then filter by collection.
-  // Without the CTE, SQLite's query planner combines FTS5 MATCH with the
-  // collection filter in a single WHERE clause, which can cause it to
-  // abandon the FTS5 index and fall back to a full scan — turning an 8ms
-  // query into a 17-second query on large collections.
-  const ftsWhere: string[] = [`documents_fts MATCH ?`];
-  const ftsParams: (string | number)[] = [ftsQuery];
-  const docFilters: string[] = [`d_filter.active = 1`];
-  const docFilterParams: string[] = [];
+  // Use a CTE to force FTS5 to run first, then apply the document filters in the
+  // OUTER query.
+  //
+  // Do NOT move these filters into the CTE as `rowid IN (SELECT ...)`: with a
+  // large corpus SQLite builds a bloom filter for that id list and re-checks it
+  // per FTS candidate. Measured on the 108k-doc кпср index (SQLite 3.49/3.51):
+  // "валюта"* 372s, "договор"* 423s, "номенклатура"* 696s, and 5.4s even for a
+  // single-match query. The same filters in the outer query: 0.01-0.03s.
+  //
+  // The outer filter can discard rows the inner LIMIT already picked, so the
+  // inner pool is larger than `limit` (candidateLimit below).
+  const docFilters: string[] = [`d.active = 1`];
+  const docFilterParams: (string | number)[] = [];
 
   if (collectionName) {
-    docFilters.push(`d_filter.collection = ?`);
+    docFilters.push(`d.collection = ?`);
     docFilterParams.push(String(collectionName));
   }
 
   if (pathPrefixes?.length) {
-    const clauses = pathPrefixes.map(() => `d_filter.path LIKE ? || '%'`).join(' OR ');
+    const clauses = pathPrefixes.map(() => `d.path LIKE ? || '%'`).join(' OR ');
     docFilters.push(`(${clauses})`);
     docFilterParams.push(...pathPrefixes);
   }
 
   if (resolvedKind === "file" || resolvedKind === "dir") {
-    docFilters.push(`COALESCE(d_filter.kind, 'file') = ?`);
+    docFilters.push(`COALESCE(d.kind, 'file') = ?`);
     docFilterParams.push(resolvedKind);
   }
 
-  if (docFilters.length > 1) {
-    ftsWhere.push(`
-      rowid IN (
-        SELECT d_filter.id
-        FROM documents d_filter
-        WHERE ${docFilters.join(' AND ')}
-      )
-    `);
-    ftsParams.push(...docFilterParams);
-  }
+  const candidateLimit = Math.max(limit * 20, 200);
 
   let sql = `
     WITH fts_matches AS (
       SELECT rowid, bm25(documents_fts, 1.5, 4.0, 1.0) as bm25_score
       FROM documents_fts
-      WHERE ${ftsWhere.join(' AND ')}
+      WHERE documents_fts MATCH ?
       ORDER BY bm25_score ASC
       LIMIT ?
     )
@@ -4598,9 +4632,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     FROM fts_matches fm
     JOIN documents d ON d.id = fm.rowid
     JOIN content ON content.hash = d.hash
-    WHERE d.active = 1
+    WHERE ${docFilters.join(' AND ')}
   `;
-  const params: (string | number)[] = [...ftsParams, limit];
+  const params: (string | number)[] = [ftsQuery, candidateLimit, ...docFilterParams];
 
   // bm25 lower is better; sort ascending.
   sql += ` ORDER BY fm.bm25_score ASC LIMIT ?`;
